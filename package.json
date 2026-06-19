@@ -1,0 +1,122 @@
+{
+  "name": "motif",
+  "version": "1.0.0",
+  "description": "AI-powered UI generation with design genomes",
+  "author": "Omer Shatzberg",
+  "private": true,
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:web": "cd web && npm run dev",
+    "dev:api": "cd api && npm run dev",
+    "build": "cd web && npm run build && cd ../api && npm run build",
+    "desktop:dev": "npm run build && electron .",
+    "desktop:pack": "npm run build && electron-builder --dir",
+    "desktop:dist": "npm run build && electron-builder",
+    "desktop:dist:win": "npm run build && electron-builder --win",
+    "desktop:dist:mac": "npm run build && electron-builder --mac",
+    "desktop:smoke": "node scripts/electron-smoke.mjs",
+    "lint": "cd web && npm run lint",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "check:genomes": "node scripts/genome-governance.mjs",
+    "smoke:quality": "node scripts/browser-quality-smoke.mjs",
+    "smoke:quality:ci": "node scripts/browser-quality-smoke.mjs --seed-if-empty",
+    "smoke:e2e": "node scripts/e2e-workflow-smoke.mjs",
+    "start": "node api/dist/index.js",
+    "postinstall": "cd api && npm install && cd ../web && npm install"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "electron": "^42.4.1",
+    "electron-builder": "^26.15.3",
+    "playwright": "^1.60.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "cors": "^2.8.6",
+    "electron-updater": "^6.8.9",
+    "express": "^5.2.1",
+    "uuid": "^14.0.0"
+  },
+  "build": {
+    "appId": "com.oshtz.motif",
+    "productName": "Motif",
+    "directories": {
+      "output": "release"
+    },
+    "icon": "assets/desktop-icon",
+    "files": [
+      "assets/desktop-icon.png",
+      "electron/**/*",
+      "web/dist/**/*",
+      "api/dist/**/*",
+      "api/package.json",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/better-sqlite3/**/*"
+    ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "oshtz",
+        "repo": "motif"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "${productName}-${version}-Setup.${ext}"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-Portable.${ext}"
+    },
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "hardenedRuntime": true,
+      "notarize": true,
+      "entitlements": "electron/entitlements.mac.plist",
+      "entitlementsInherit": "electron/entitlements.mac.inherit.plist",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    }
+  }
+}

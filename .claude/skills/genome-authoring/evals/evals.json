@@ -1,0 +1,23 @@
+{
+  "skill_name": "genome-authoring",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I want to add a new genome that captures the aesthetic of old scientific calculators — like the HP-41C or TI-59. Think amber/orange segmented LCD displays on dark plastic, physical membrane buttons with that satisfying click feel, and the whole engineering precision vibe of 1970s-80s Hewlett-Packard instruments.",
+      "expected_output": "A complete genome markdown file with all 9 layers specified. Should include: segmented display typography, constrained color palette (amber segments on dark), membrane-button component patterns, calculator-specific editorial voice (abbreviated labels like 'STO', 'RCL', 'PRG'), and anti-patterns that prevent modern UI conventions from leaking in.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Create a genome inspired by Japanese woodblock prints and wabi-sabi philosophy — think Hokusai meets modern web. Muted earth tones, deliberate imperfection, asymmetric compositions, brush-stroke textures, and that sense of transient beauty. Something that feels handmade and contemplative rather than mass-produced.",
+      "expected_output": "A complete genome file with organic, brush-inspired aesthetics. Should define warm earth-tone palette, textured borders (not clean lines), asymmetric spacing rules, serif/brush typography, a contemplative editorial voice, and anti-patterns banning sharp geometric precision and neon colors.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "I need a genome that looks like a 1990s rave flyer — you know, those acid house party invitations with wild neon colors on black, stretched and distorted type, smiley faces, checkerboard patterns, and that whole underground club culture aesthetic. Chaotic but with an underlying grid.",
+      "expected_output": "A genome with high-contrast neon-on-black palette, distorted/stretched typography, checkerboard and pattern atmosphere effects, energetic editorial voice, aggressive interaction states, and anti-patterns preventing corporate/clean aesthetics.",
+      "files": []
+    }
+  ]
+}

@@ -1,0 +1,216 @@
+name: Desktop Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package-windows:
+    name: Windows Installer and Portable
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web and API
+        run: npm run build
+
+      - name: Report Windows signing mode
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CSC_LINK)) {
+            Write-Warning "WINDOWS_CODESIGN_CERTIFICATE is not configured; Windows artifacts will be unsigned."
+          } else {
+            "WINDOWS_CODESIGN_CERTIFICATE is configured."
+          }
+        env:
+          CSC_LINK: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
+
+      - name: Build Windows installer, portable EXE, and updater assets
+        run: npx electron-builder --win --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_LINK: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
+          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+
+      - name: Verify Windows artifacts
+        shell: pwsh
+        run: |
+          $patterns = @(
+            "release/Motif-*-Setup.exe",
+            "release/Motif-*-Portable.exe",
+            "release/Motif-*-win.zip",
+            "release/latest.yml"
+          )
+          foreach ($pattern in $patterns) {
+            if (-not (Get-ChildItem -Path $pattern -File -ErrorAction SilentlyContinue)) {
+              Write-Error "Missing required Windows artifact: $pattern"
+            }
+          }
+
+      - name: Smoke test Windows desktop app
+        run: npm run desktop:smoke
+        env:
+          MOTIF_DISABLE_UPDATER: "1"
+
+      - name: Generate Windows checksums
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path release -File | Where-Object {
+            $_.Name -like "*.exe" -or
+            $_.Name -like "*.zip" -or
+            $_.Name -like "*.blockmap" -or
+            $_.Name -like "latest*.yml"
+          } | Sort-Object Name
+          $lines = foreach ($file in $files) {
+            $hash = Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256
+            "$($hash.Hash.ToLowerInvariant())  $($file.Name)"
+          }
+          $lines | Set-Content -LiteralPath release/SHA256SUMS-windows.txt
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: motif-windows
+          path: |
+            release/*.exe
+            release/*.zip
+            release/*.blockmap
+            release/latest*.yml
+            release/SHA256SUMS-windows.txt
+
+      - name: Publish Windows release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.exe
+            release/*.zip
+            release/*.blockmap
+            release/latest*.yml
+            release/SHA256SUMS-windows.txt
+
+  package-macos:
+    name: macOS DMG
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web and API
+        run: npm run build
+
+      - name: Validate macOS signing and notarization inputs
+        run: |
+          missing=0
+          for name in MAC_CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::${name} is required for signed and notarized macOS desktop releases"
+              missing=1
+            fi
+          done
+          exit "$missing"
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD || secrets.MAC_CSC_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Build macOS DMG and updater assets
+        run: npx electron-builder --mac --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD || secrets.MAC_CSC_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Verify macOS signing and notarization
+        run: |
+          found=0
+          for app in release/mac*/Motif.app; do
+            [ -d "$app" ] || continue
+            found=1
+            codesign --verify --deep --strict --verbose=2 "$app"
+            spctl --assess --verbose --type exec "$app"
+            xcrun stapler validate "$app"
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No packaged Motif.app bundle found under release/mac*"
+            exit 1
+          fi
+
+      - name: Verify macOS artifacts
+        run: |
+          for pattern in "release/*.dmg" "release/*.zip" "release/latest*.yml"; do
+            if ! compgen -G "$pattern" > /dev/null; then
+              echo "::error::Missing required macOS artifact: $pattern"
+              exit 1
+            fi
+          done
+
+      - name: Smoke test macOS desktop app
+        run: npm run desktop:smoke
+        env:
+          MOTIF_DISABLE_UPDATER: "1"
+
+      - name: Generate macOS checksums
+        run: |
+          : > release/SHA256SUMS-macos.txt
+          for pattern in release/*.dmg release/*.zip release/*.blockmap release/latest*.yml; do
+            for file in $pattern; do
+              [ -e "$file" ] || continue
+              shasum -a 256 "$file" | sed 's#release/##' >> release/SHA256SUMS-macos.txt
+            done
+          done
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: motif-macos
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.blockmap
+            release/latest*.yml
+            release/SHA256SUMS-macos.txt
+
+      - name: Publish macOS release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.dmg
+            release/*.zip
+            release/*.blockmap
+            release/latest*.yml
+            release/SHA256SUMS-macos.txt

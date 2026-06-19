@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+jobs:
+  verify:
+    name: Build, Test, And Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Audit genomes
+        run: npm run check:genomes
+
+      - name: Build and test
+        run: npm test
+
+  browser-smoke:
+    name: Browser Quality Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run E2E workflow smoke
+        timeout-minutes: 5
+        run: npm run smoke:e2e
+
+      - name: Build
+        run: npm run build
+
+      - name: Start API
+        run: |
+          mkdir -p artifacts/ci
+          nohup npm start > artifacts/ci/api.log 2>&1 &
+          echo $! > artifacts/ci/api.pid
+
+      - name: Wait for API
+        run: |
+          node -e "const url='http://localhost:4389/api/generations'; const deadline=Date.now()+30000; (async()=>{ while(Date.now()<deadline){ try { const res=await fetch(url); if(res.ok) process.exit(0); } catch {} await new Promise(r=>setTimeout(r,500)); } console.error('API did not become ready'); process.exit(1); })();"
+
+      - name: Run browser quality smoke
+        timeout-minutes: 5
+        run: npm run smoke:quality:ci
+
+      - name: Upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-quality-smoke
+          path: |
+            artifacts/browser-quality/
+            artifacts/ci/
