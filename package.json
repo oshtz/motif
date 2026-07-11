@@ -1,6 +1,6 @@
 {
   "name": "motif",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "AI-powered UI generation with design genomes",
   "author": "Omer Shatzberg",
   "private": true,
@@ -14,7 +14,7 @@
     "dev:web": "npm run --workspace web dev",
     "dev:api": "npm run --workspace api dev",
     "build": "npm run --workspace web build && npm run --workspace api build",
-    "desktop:prepare": "electron-builder install-app-deps",
+    "desktop:prepare": "electron-rebuild -f -w better-sqlite3",
     "desktop:dev": "npm run build && npm run desktop:prepare && electron .",
     "desktop:pack": "npm run build && npm run desktop:prepare && electron-builder --dir",
     "desktop:dist": "npm run build && npm run desktop:prepare && electron-builder",
@@ -32,6 +32,7 @@
     "start": "npm run --workspace api start"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.2.0",
     "concurrently": "^9.1.0",
     "electron": "^42.4.1",
     "electron-builder": "^26.15.3",
@@ -70,30 +71,12 @@
     "win": {
       "target": [
         {
-          "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        },
-        {
-          "target": "zip",
-          "arch": [
-            "x64"
-          ]
-        },
-        {
           "target": "portable",
           "arch": [
             "x64"
           ]
         }
       ]
-    },
-    "nsis": {
-      "oneClick": false,
-      "perMachine": false,
-      "allowToChangeInstallationDirectory": true,
-      "artifactName": "${productName}-${version}-Setup.${ext}"
     },
     "portable": {
       "artifactName": "${productName}-${version}-Portable.${ext}"
@@ -108,15 +91,13 @@
         {
           "target": "dmg",
           "arch": [
-            "x64",
-            "arm64"
+            "universal"
           ]
         },
         {
           "target": "zip",
           "arch": [
-            "x64",
-            "arm64"
+            "universal"
           ]
         }
       ],

@@ -10,7 +10,7 @@ process.env.MOTIF_DISABLE_UPDATER ??= "1";
 function findExecutable() {
   if (process.env.MOTIF_EXECUTABLE) return path.resolve(process.env.MOTIF_EXECUTABLE);
   const candidates = process.platform === "darwin"
-    ? ["release/mac-arm64/Motif.app/Contents/MacOS/Motif", "release/mac/Motif.app/Contents/MacOS/Motif"]
+    ? ["release/mac-universal/Motif.app/Contents/MacOS/Motif", "release/mac/Motif.app/Contents/MacOS/Motif"]
     : process.platform === "win32"
       ? ["release/win-unpacked/Motif.exe"]
       : ["release/linux-unpacked/motif"];

@@ -39,7 +39,7 @@ jobs:
           fi
 
   package-windows:
-    name: Windows Installer and Portable
+    name: Windows Portable
     needs: preflight
     runs-on: windows-latest
     timeout-minutes: 40
@@ -55,25 +55,13 @@ jobs:
       - name: Verify artifacts
         shell: pwsh
         run: |
-          $patterns = @("release/Motif-*-Setup.exe", "release/Motif-*-Portable.exe", "release/Motif-*-win.zip", "release/latest.yml")
-          foreach ($pattern in $patterns) {
-            if (-not (Get-ChildItem $pattern -File -ErrorAction SilentlyContinue)) { throw "Missing required artifact: $pattern" }
-          }
+          if (-not (Get-ChildItem "release/Motif-*-Portable.exe" -File -ErrorAction SilentlyContinue)) { throw "Missing portable executable" }
           Write-Host "::notice::Windows artifacts are intentionally published without Authenticode signing"
       - name: Smoke unpacked app
         run: npm run desktop:smoke
         env:
           MOTIF_DISABLE_UPDATER: "1"
           MOTIF_SMOKE_USER_DATA: ${{ runner.temp }}\motif-smoke-unpacked
-      - name: Smoke installed app
-        shell: pwsh
-        run: |
-          $setup = (Get-ChildItem release/Motif-*-Setup.exe).FullName
-          $install = Join-Path $env:RUNNER_TEMP "motif-installed"
-          Start-Process -FilePath $setup -ArgumentList "/S", "/D=$install" -Wait
-          $env:MOTIF_EXECUTABLE = Join-Path $install "Motif.exe"
-          $env:MOTIF_SMOKE_USER_DATA = Join-Path $env:RUNNER_TEMP "motif-smoke-installed"
-          npm run desktop:smoke
       - name: Smoke portable app
         shell: pwsh
         run: |
@@ -83,7 +71,7 @@ jobs:
       - name: Generate final checksums
         shell: pwsh
         run: |
-          $files = Get-ChildItem release -File | Where-Object { $_.Extension -in ".exe", ".zip", ".blockmap" -or $_.Name -eq "latest.yml" } | Sort-Object Name
+          $files = Get-ChildItem release/Motif-*-Portable.exe -File
           $lines = foreach ($file in $files) {
             $hash = Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256
             "$($hash.Hash.ToLowerInvariant())  $($file.Name)"
@@ -94,10 +82,7 @@ jobs:
           name: motif-windows
           if-no-files-found: error
           path: |
-            release/*.exe
-            release/*.zip
-            release/*.blockmap
-            release/latest.yml
+            release/*-Portable.exe
             release/SHA256SUMS-windows.txt
 
   package-macos:
@@ -164,22 +149,22 @@ jobs:
           for pattern in "release/*.dmg" "release/*.zip" "release/latest-mac.yml"; do
             compgen -G "$pattern" >/dev/null || { echo "::error::Missing $pattern"; exit 1; }
           done
-      - name: Smoke arm64 packaged app
-        run: MOTIF_EXECUTABLE="release/mac-arm64/Motif.app/Contents/MacOS/Motif" MOTIF_SMOKE_USER_DATA="$RUNNER_TEMP/motif-smoke-mac-arm64" npm run desktop:smoke
-      - name: Smoke arm64 DMG
+      - name: Smoke universal packaged app
+        run: MOTIF_EXECUTABLE="release/mac-universal/Motif.app/Contents/MacOS/Motif" MOTIF_SMOKE_USER_DATA="$RUNNER_TEMP/motif-smoke-mac-universal" npm run desktop:smoke
+      - name: Smoke universal DMG on arm64
         run: |
-          dmg=$(compgen -G "release/Motif-*-arm64.dmg")
-          [ -f "$dmg" ] || { echo "::error::Missing arm64 DMG"; exit 1; }
-          mount="$RUNNER_TEMP/motif-dmg-arm64"
+          dmg=$(compgen -G "release/Motif-*-universal.dmg")
+          [ -f "$dmg" ] || { echo "::error::Missing universal DMG"; exit 1; }
+          mount="$RUNNER_TEMP/motif-dmg-universal"
           mkdir -p "$mount"
           hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount"
-          cp -R "$mount/Motif.app" "$RUNNER_TEMP/Motif-arm64.app"
+          cp -R "$mount/Motif.app" "$RUNNER_TEMP/Motif-universal.app"
           hdiutil detach "$mount"
-          MOTIF_EXECUTABLE="$RUNNER_TEMP/Motif-arm64.app/Contents/MacOS/Motif" MOTIF_SMOKE_USER_DATA="$RUNNER_TEMP/motif-smoke-dmg-arm64" npm run desktop:smoke
+          MOTIF_EXECUTABLE="$RUNNER_TEMP/Motif-universal.app/Contents/MacOS/Motif" MOTIF_SMOKE_USER_DATA="$RUNNER_TEMP/motif-smoke-dmg-universal-arm64" npm run desktop:smoke
       - name: Generate final checksums
         run: |
           : > release/SHA256SUMS-macos.txt
-          find release -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.blockmap' -o -name 'latest*.yml' \) -print0 \
+          find release -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.zip' -o -name 'latest*.yml' \) -print0 \
             | sort -z \
             | xargs -0 shasum -a 256 \
             | sed 's#release/##' >> release/SHA256SUMS-macos.txt
@@ -190,7 +175,6 @@ jobs:
           path: |
             release/*.dmg
             release/*.zip
-            release/*.blockmap
             release/latest-mac.yml
             release/SHA256SUMS-macos.txt
 
@@ -210,22 +194,22 @@ jobs:
         with:
           name: motif-macos
           path: release
-      - name: Verify and smoke x64 DMG
+      - name: Verify and smoke universal DMG on Intel
         run: |
           [ "$(uname -m)" = "x86_64" ] || { echo "::error::Intel smoke requires an x86_64 runner"; exit 1; }
-          dmg=$(compgen -G "release/Motif-*-x64.dmg")
-          [ -f "$dmg" ] || { echo "::error::Missing x64 DMG"; exit 1; }
+          dmg=$(compgen -G "release/Motif-*-universal.dmg")
+          [ -f "$dmg" ] || { echo "::error::Missing universal DMG"; exit 1; }
           xcrun stapler validate "$dmg"
-          mount="$RUNNER_TEMP/motif-dmg-x64"
+          mount="$RUNNER_TEMP/motif-dmg-universal-intel"
           mkdir -p "$mount"
           hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount"
           trap 'hdiutil detach "$mount"' EXIT
-          cp -R "$mount/Motif.app" "$RUNNER_TEMP/Motif-x64.app"
+          cp -R "$mount/Motif.app" "$RUNNER_TEMP/Motif-universal.app"
           hdiutil detach "$mount"
           trap - EXIT
-          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/Motif-x64.app"
-          spctl --assess --verbose --type exec "$RUNNER_TEMP/Motif-x64.app"
-          MOTIF_EXECUTABLE="$RUNNER_TEMP/Motif-x64.app/Contents/MacOS/Motif" MOTIF_SMOKE_USER_DATA="$RUNNER_TEMP/motif-smoke-dmg-x64" npm run desktop:smoke
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/Motif-universal.app"
+          spctl --assess --verbose --type exec "$RUNNER_TEMP/Motif-universal.app"
+          MOTIF_EXECUTABLE="$RUNNER_TEMP/Motif-universal.app/Contents/MacOS/Motif" MOTIF_SMOKE_USER_DATA="$RUNNER_TEMP/motif-smoke-dmg-universal-intel" npm run desktop:smoke
 
   publish:
     name: Publish Complete Immutable Release
@@ -262,5 +246,8 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
           files: |
-            release/windows/*
-            release/macos/*
+            release/windows/Motif-*-Portable.exe
+            release/windows/SHA256SUMS-windows.txt
+            release/macos/Motif-*-universal.dmg
+            release/macos/Motif-*-universal.zip
+            release/macos/latest-mac.yml

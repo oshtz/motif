@@ -26,9 +26,8 @@ Use one of these files:
 
 | Platform | File |
 | --- | --- |
-| Windows installer | `Motif-*-Setup.exe` |
 | Windows portable | `Motif-*-Portable.exe` |
-| macOS | `Motif-*-arm64.dmg` for Apple Silicon, `Motif-*-x64.dmg` for Intel |
+| macOS | `Motif-*-universal.dmg` for Apple Silicon and Intel |
 
 The other files attached to each release are updater metadata and integrity files. Motif keeps projects and settings on the local device by default; prompts and inputs are sent to the provider you configure. See [Security and Privacy](docs/security-privacy.md).
 
