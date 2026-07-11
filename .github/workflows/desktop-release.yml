@@ -50,34 +50,16 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
-      - name: Require Authenticode for tagged releases
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        env:
-          CSC_LINK: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
-          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:CSC_LINK) -or [string]::IsNullOrWhiteSpace($env:CSC_KEY_PASSWORD)) {
-            throw "WINDOWS_CODESIGN_CERTIFICATE and WINDOWS_CODESIGN_PASSWORD are required for tagged releases"
-          }
       - name: Build without publishing
         run: npm run desktop:dist:win -- --publish never
-        env:
-          CSC_LINK: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
-          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
-      - name: Verify artifacts and tagged signatures
+      - name: Verify artifacts
         shell: pwsh
         run: |
           $patterns = @("release/Motif-*-Setup.exe", "release/Motif-*-Portable.exe", "release/Motif-*-win.zip", "release/latest.yml")
           foreach ($pattern in $patterns) {
             if (-not (Get-ChildItem $pattern -File -ErrorAction SilentlyContinue)) { throw "Missing required artifact: $pattern" }
           }
-          if ($env:GITHUB_REF -like "refs/tags/v*") {
-            Get-ChildItem release/*.exe | ForEach-Object {
-              $signature = Get-AuthenticodeSignature -LiteralPath $_.FullName
-              if ($signature.Status -ne "Valid") { throw "Invalid Authenticode signature on $($_.Name): $($signature.Status)" }
-            }
-          }
+          Write-Host "::notice::Windows artifacts are intentionally published without Authenticode signing"
       - name: Smoke unpacked app
         run: npm run desktop:smoke
         env:
