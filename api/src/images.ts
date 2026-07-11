@@ -21,20 +21,21 @@ export async function searchImages(options: {
   pexelsApiKey?: string;
   accessKey?: string;  // Unsplash access key
   count?: number;
+  signal?: AbortSignal;
 }): Promise<ImageResult[]> {
-  const { query, pexelsApiKey, accessKey, count = 6 } = options;
+  const { query, pexelsApiKey, accessKey, count = 6, signal = AbortSignal.timeout(15_000) } = options;
 
   if (!query.trim()) return [];
 
   // Try Pexels first (more generous rate limits)
   if (pexelsApiKey) {
-    const results = await searchPexels({ query, apiKey: pexelsApiKey, count });
+    const results = await searchPexels({ query, apiKey: pexelsApiKey, count, signal });
     if (results.length > 0) return results;
   }
 
   // Fall back to Unsplash
   if (accessKey) {
-    return searchUnsplash({ query, accessKey, count });
+    return searchUnsplash({ query, accessKey, count, signal });
   }
 
   return [];
@@ -44,8 +45,9 @@ async function searchPexels(options: {
   query: string;
   apiKey: string;
   count: number;
+  signal: AbortSignal;
 }): Promise<ImageResult[]> {
-  const { query, apiKey, count } = options;
+  const { query, apiKey, count, signal } = options;
 
   try {
     const params = new URLSearchParams({
@@ -56,7 +58,7 @@ async function searchPexels(options: {
 
     const res = await fetch(
       `https://api.pexels.com/v1/search?${params}`,
-      { headers: { Authorization: apiKey } }
+      { headers: { Authorization: apiKey }, signal }
     );
 
     if (!res.ok) {
@@ -84,6 +86,7 @@ async function searchUnsplash(options: {
   query: string;
   accessKey: string;
   count: number;
+  signal: AbortSignal;
 }): Promise<ImageResult[]> {
   try {
     const params = new URLSearchParams({
@@ -95,6 +98,7 @@ async function searchUnsplash(options: {
     const res = await fetch(
       `https://api.unsplash.com/search/photos?${params}`,
       {
+        signal: options.signal,
         headers: {
           Authorization: `Client-ID ${options.accessKey}`,
         },

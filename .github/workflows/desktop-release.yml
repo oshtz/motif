@@ -7,154 +7,149 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  package-windows:
-    name: Windows Installer and Portable
-    runs-on: windows-latest
-    timeout-minutes: 30
-
+  preflight:
+    name: Release Preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Setup Node
-        uses: actions/setup-node@v6
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build web and API
-        run: npm run build
-
-      - name: Report Windows signing mode
-        shell: pwsh
+      - run: npm ci
+      - run: npm run check:desktop-security
+      - run: npm run check:release
+      - run: npm test
+      - name: Reject an existing release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:CSC_LINK)) {
-            Write-Warning "WINDOWS_CODESIGN_CERTIFICATE is not configured; Windows artifacts will be unsigned."
-          } else {
-            "WINDOWS_CODESIGN_CERTIFICATE is configured."
-          }
-        env:
-          CSC_LINK: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "::error::Release ${GITHUB_REF_NAME} already exists and is immutable"
+            exit 1
+          fi
 
-      - name: Build Windows installer, portable EXE, and updater assets
-        run: npx electron-builder --win --publish never
+  package-windows:
+    name: Windows Installer and Portable
+    needs: preflight
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Require Authenticode for tagged releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_LINK: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
           CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
-
-      - name: Verify Windows artifacts
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CSC_LINK) -or [string]::IsNullOrWhiteSpace($env:CSC_KEY_PASSWORD)) {
+            throw "WINDOWS_CODESIGN_CERTIFICATE and WINDOWS_CODESIGN_PASSWORD are required for tagged releases"
+          }
+      - name: Build without publishing
+        run: npm run desktop:dist:win -- --publish never
+        env:
+          CSC_LINK: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE }}
+          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+      - name: Verify artifacts and tagged signatures
         shell: pwsh
         run: |
-          $patterns = @(
-            "release/Motif-*-Setup.exe",
-            "release/Motif-*-Portable.exe",
-            "release/Motif-*-win.zip",
-            "release/latest.yml"
-          )
+          $patterns = @("release/Motif-*-Setup.exe", "release/Motif-*-Portable.exe", "release/Motif-*-win.zip", "release/latest.yml")
           foreach ($pattern in $patterns) {
-            if (-not (Get-ChildItem -Path $pattern -File -ErrorAction SilentlyContinue)) {
-              Write-Error "Missing required Windows artifact: $pattern"
+            if (-not (Get-ChildItem $pattern -File -ErrorAction SilentlyContinue)) { throw "Missing required artifact: $pattern" }
+          }
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            Get-ChildItem release/*.exe | ForEach-Object {
+              $signature = Get-AuthenticodeSignature -LiteralPath $_.FullName
+              if ($signature.Status -ne "Valid") { throw "Invalid Authenticode signature on $($_.Name): $($signature.Status)" }
             }
           }
-
-      - name: Smoke test Windows desktop app
+      - name: Smoke unpacked app
         run: npm run desktop:smoke
         env:
           MOTIF_DISABLE_UPDATER: "1"
-
-      - name: Generate Windows checksums
+          MOTIF_SMOKE_USER_DATA: ${{ runner.temp }}\motif-smoke-unpacked
+      - name: Smoke installed app
         shell: pwsh
         run: |
-          $files = Get-ChildItem -Path release -File | Where-Object {
-            $_.Name -like "*.exe" -or
-            $_.Name -like "*.zip" -or
-            $_.Name -like "*.blockmap" -or
-            $_.Name -like "latest*.yml"
-          } | Sort-Object Name
+          $setup = (Get-ChildItem release/Motif-*-Setup.exe).FullName
+          $install = Join-Path $env:RUNNER_TEMP "motif-installed"
+          Start-Process -FilePath $setup -ArgumentList "/S", "/D=$install" -Wait
+          $env:MOTIF_EXECUTABLE = Join-Path $install "Motif.exe"
+          $env:MOTIF_SMOKE_USER_DATA = Join-Path $env:RUNNER_TEMP "motif-smoke-installed"
+          npm run desktop:smoke
+      - name: Smoke portable app
+        shell: pwsh
+        run: |
+          $env:MOTIF_EXECUTABLE = (Get-ChildItem release/Motif-*-Portable.exe).FullName
+          $env:MOTIF_SMOKE_USER_DATA = Join-Path $env:RUNNER_TEMP "motif-smoke-portable"
+          npm run desktop:smoke
+      - name: Generate final checksums
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem release -File | Where-Object { $_.Extension -in ".exe", ".zip", ".blockmap", ".yml" } | Sort-Object Name
           $lines = foreach ($file in $files) {
             $hash = Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256
             "$($hash.Hash.ToLowerInvariant())  $($file.Name)"
           }
-          $lines | Set-Content -LiteralPath release/SHA256SUMS-windows.txt
-
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v7
+          $lines | Set-Content release/SHA256SUMS-windows.txt
+      - uses: actions/upload-artifact@v7
         with:
           name: motif-windows
+          if-no-files-found: error
           path: |
             release/*.exe
             release/*.zip
             release/*.blockmap
-            release/latest*.yml
-            release/SHA256SUMS-windows.txt
-
-      - name: Publish Windows release assets
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release/*.exe
-            release/*.zip
-            release/*.blockmap
-            release/latest*.yml
+            release/latest.yml
             release/SHA256SUMS-windows.txt
 
   package-macos:
-    name: macOS DMG
+    name: Signed macOS DMGs
+    needs: preflight
     runs-on: macos-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 45
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Setup Node
-        uses: actions/setup-node@v6
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build web and API
-        run: npm run build
-
-      - name: Validate macOS signing and notarization inputs
-        run: |
-          missing=0
-          for name in MAC_CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
-            if [ -z "${!name}" ]; then
-              echo "::error::${name} is required for signed and notarized macOS desktop releases"
-              missing=1
-            fi
-          done
-          exit "$missing"
+      - run: npm ci
+      - name: Require signing and notarization inputs
         env:
-          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD || secrets.MAC_CSC_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-
-      - name: Build macOS DMG and updater assets
-        run: npx electron-builder --mac --publish never
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD || secrets.MAC_CSC_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-
-      - name: Verify macOS signing and notarization
+        run: |
+          for name in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            [ -n "${!name}" ] || { echo "::error::${name} is required"; exit 1; }
+          done
+      - name: Build signed and notarized artifacts without publishing
+        run: npm run desktop:dist:mac -- --publish never
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD || secrets.MAC_CSC_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      - name: Verify signing, notarization, and artifacts
         run: |
           found=0
           for app in release/mac*/Motif.app; do
@@ -164,53 +159,82 @@ jobs:
             spctl --assess --verbose --type exec "$app"
             xcrun stapler validate "$app"
           done
-          if [ "$found" -eq 0 ]; then
-            echo "::error::No packaged Motif.app bundle found under release/mac*"
-            exit 1
-          fi
-
-      - name: Verify macOS artifacts
-        run: |
-          for pattern in "release/*.dmg" "release/*.zip" "release/latest*.yml"; do
-            if ! compgen -G "$pattern" > /dev/null; then
-              echo "::error::Missing required macOS artifact: $pattern"
-              exit 1
-            fi
+          [ "$found" -eq 1 ] || { echo "::error::No Motif.app bundles found"; exit 1; }
+          for dmg in release/*.dmg; do xcrun stapler validate "$dmg"; done
+          for pattern in "release/*.dmg" "release/*.zip" "release/latest-mac.yml"; do
+            compgen -G "$pattern" >/dev/null || { echo "::error::Missing $pattern"; exit 1; }
           done
-
-      - name: Smoke test macOS desktop app
-        run: npm run desktop:smoke
-        env:
-          MOTIF_DISABLE_UPDATER: "1"
-
-      - name: Generate macOS checksums
+      - name: Smoke packaged apps
+        run: |
+          index=0
+          for executable in release/mac*/Motif.app/Contents/MacOS/Motif; do
+            [ -x "$executable" ] || continue
+            MOTIF_EXECUTABLE="$executable" MOTIF_SMOKE_USER_DATA="$RUNNER_TEMP/motif-smoke-mac-$index" npm run desktop:smoke
+            index=$((index + 1))
+          done
+      - name: Smoke DMGs
+        run: |
+          index=0
+          for dmg in release/*.dmg; do
+            mount="$RUNNER_TEMP/motif-dmg-$index"
+            mkdir -p "$mount"
+            hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount"
+            cp -R "$mount/Motif.app" "$RUNNER_TEMP/Motif-$index.app"
+            hdiutil detach "$mount"
+            MOTIF_EXECUTABLE="$RUNNER_TEMP/Motif-$index.app/Contents/MacOS/Motif" MOTIF_SMOKE_USER_DATA="$RUNNER_TEMP/motif-smoke-dmg-$index" npm run desktop:smoke
+            index=$((index + 1))
+          done
+      - name: Generate final checksums
         run: |
           : > release/SHA256SUMS-macos.txt
-          for pattern in release/*.dmg release/*.zip release/*.blockmap release/latest*.yml; do
-            for file in $pattern; do
-              [ -e "$file" ] || continue
-              shasum -a 256 "$file" | sed 's#release/##' >> release/SHA256SUMS-macos.txt
-            done
-          done
-
-      - name: Upload macOS artifacts
-        uses: actions/upload-artifact@v7
+          find release -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.blockmap' -o -name 'latest*.yml' \) -print0 \
+            | sort -z \
+            | xargs -0 shasum -a 256 \
+            | sed 's#release/##' >> release/SHA256SUMS-macos.txt
+      - uses: actions/upload-artifact@v7
         with:
           name: motif-macos
+          if-no-files-found: error
           path: |
             release/*.dmg
             release/*.zip
             release/*.blockmap
-            release/latest*.yml
+            release/latest-mac.yml
             release/SHA256SUMS-macos.txt
 
-      - name: Publish macOS release assets
-        if: startsWith(github.ref, 'refs/tags/v')
+  publish:
+    name: Publish Complete Immutable Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [package-windows, package-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    environment: release
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: motif-windows
+          path: release/windows
+      - uses: actions/download-artifact@v8
+        with:
+          name: motif-macos
+          path: release/macos
+      - name: Verify final artifact set
+        run: node scripts/verify-release-artifacts.mjs release
+      - name: Recheck immutable release boundary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "::error::Release ${GITHUB_REF_NAME} already exists and will not be changed"
+            exit 1
+          fi
+      - name: Publish once
         uses: softprops/action-gh-release@v2
         with:
+          fail_on_unmatched_files: true
           files: |
-            release/*.dmg
-            release/*.zip
-            release/*.blockmap
-            release/latest*.yml
-            release/SHA256SUMS-macos.txt
+            release/windows/*
+            release/macos/*

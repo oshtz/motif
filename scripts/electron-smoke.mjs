@@ -1,118 +1,117 @@
-import fs from "fs";
-import path from "path";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { _electron as electron } from "playwright";
 
 process.env.MOTIF_DISABLE_UPDATER ??= "1";
 
 function findExecutable() {
+  if (process.env.MOTIF_EXECUTABLE) return path.resolve(process.env.MOTIF_EXECUTABLE);
   const candidates = process.platform === "darwin"
-    ? [
-        "release/mac-arm64/Motif.app/Contents/MacOS/Motif",
-        "release/mac/Motif.app/Contents/MacOS/Motif",
-      ]
+    ? ["release/mac-arm64/Motif.app/Contents/MacOS/Motif", "release/mac/Motif.app/Contents/MacOS/Motif"]
     : process.platform === "win32"
       ? ["release/win-unpacked/Motif.exe"]
       : ["release/linux-unpacked/motif"];
-
-  const executablePath = candidates
-    .map((candidate) => path.resolve(candidate))
-    .find((candidate) => fs.existsSync(candidate));
-
-  if (!executablePath) {
-    throw new Error(`No packaged Motif executable found for ${process.platform}`);
-  }
-
+  const executablePath = candidates.map((candidate) => path.resolve(candidate)).find(fs.existsSync);
+  if (!executablePath) throw new Error(`No packaged Motif executable found for ${process.platform}`);
   return executablePath;
 }
 
-const app = await electron.launch({ executablePath: findExecutable() });
-let appClosed = false;
+const executablePath = findExecutable();
+const userData = path.resolve(process.env.MOTIF_SMOKE_USER_DATA || fs.mkdtempSync(path.join(os.tmpdir(), "motif-smoke-")));
+const expectedVersion = process.env.MOTIF_EXPECT_VERSION || JSON.parse(fs.readFileSync("package.json", "utf8")).version;
+const markerPath = path.join(userData, "desktop-smoke.marker");
 
+async function launch() {
+  return electron.launch({ executablePath, args: [`--user-data-dir=${userData}`] });
+}
+
+const first = await launch();
 try {
-  const page = await app.firstWindow({ timeout: 30000 });
+  const page = await first.firstWindow({ timeout: 30000 });
   await page.waitForSelector('[data-testid="desktop-titlebar"]', { timeout: 30000 });
-  const isMac = process.platform === "darwin";
-
-  const restoreAndFocus = async () => {
-    await app.evaluate(({ BrowserWindow }) => {
-      const window = BrowserWindow.getAllWindows()[0];
-      window?.restore();
-      window?.show();
-      window?.focus();
+  const runtime = await first.evaluate(({ app }) => ({ version: app.getVersion(), userData: app.getPath("userData") }));
+  assert.equal(runtime.version, expectedVersion);
+  assert.equal(path.resolve(runtime.userData), userData);
+  const loaded = new URL(page.url());
+  assert.equal(loaded.hostname, "127.0.0.1");
+  assert.equal(loaded.search, "");
+  assert.equal(await page.evaluate(() => window.motifDesktop?.getSessionToken().length === 43), true);
+  const isolation = await page.evaluate(async () => {
+    const sessionToken = window.motifDesktop?.getSessionToken() || "";
+    const previewToken = window.motifDesktop?.getPreviewToken() || "";
+    const parsed_html = `<!doctype html><script>(async()=>{let parentBlocked=false;try{parent.document.body}catch{parentBlocked=true}const apiStatus=await fetch('/api/settings').then(r=>r.status).catch(()=>0);parent.postMessage({type:'motif-isolation-proof',parentBlocked,apiStatus},'*')})()<\/script>`;
+    const saved = await fetch("/api/compare/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Motif-Session": sessionToken },
+      body: JSON.stringify({ prompt: "isolation proof", parsed_html }),
+    }).then((response) => response.json());
+    const result = new Promise((resolve) => {
+      const handler = (event) => {
+        if (event.data?.type !== "motif-isolation-proof") return;
+        window.removeEventListener("message", handler);
+        resolve(event.data);
+      };
+      window.addEventListener("message", handler);
     });
-    await page.bringToFront().catch(() => {});
-    await page.waitForTimeout(500);
-  };
+    const frame = document.createElement("iframe");
+    frame.sandbox.value = "allow-scripts";
+    frame.src = `/interactive/${encodeURIComponent(saved.id)}?token=${encodeURIComponent(previewToken)}`;
+    document.body.append(frame);
+    const proof = await Promise.race([result, new Promise((resolve) => setTimeout(() => resolve(null), 5000))]);
+    frame.remove();
+    await fetch(`/api/generations/${encodeURIComponent(saved.id)}`, {
+      method: "DELETE",
+      headers: { "X-Motif-Session": sessionToken },
+    });
+    return proof;
+  });
+  assert.equal(isolation?.type, "motif-isolation-proof");
+  assert.equal(isolation?.parentBlocked, true);
+  assert.notEqual(isolation?.apiStatus, 200);
+  fs.writeFileSync(markerPath, expectedVersion);
+} finally {
+  await first.close();
+}
+
+const second = await launch();
+try {
+  const page = await second.firstWindow({ timeout: 30000 });
+  await page.waitForSelector('[data-testid="desktop-titlebar"]', { timeout: 30000 });
+  assert.equal(fs.readFileSync(markerPath, "utf8"), expectedVersion);
+  assert.equal(fs.existsSync(path.join(userData, "motif.db")), true);
+  await page.waitForTimeout(500);
+
+  const settingsDialog = page.locator('dialog[aria-labelledby="settings-title"]');
+  if (await settingsDialog.isVisible()) {
+    await page.keyboard.press("Escape");
+    await settingsDialog.waitFor({ state: "hidden" });
+  }
 
   const controls = await Promise.all([
     page.locator('[data-testid="window-minimize"]').count(),
     page.locator('[data-testid="window-maximize"]').count(),
     page.locator('[data-testid="window-close"]').count(),
   ]);
+  assert.deepEqual(controls, [1, 1, 1]);
 
   await page.locator('[data-testid="window-minimize"]').click();
   await page.waitForTimeout(300);
-  const minimized = await app.evaluate(
-    ({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.isMinimized() ?? false
-  );
-  await restoreAndFocus();
+  assert.equal(await second.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.isMinimized()), true);
+  await second.evaluate(({ BrowserWindow }) => {
+    BrowserWindow.getAllWindows()[0]?.restore();
+    BrowserWindow.getAllWindows()[0]?.show();
+  });
+  await page.waitForTimeout(300);
 
-  await page.locator('[data-testid="window-maximize"]').click({ force: true });
-  await page.waitForTimeout(500);
-  const maximized = await app.evaluate(
-    ({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.isMaximized() ?? false
-  );
-
-  let restored = true;
-  if (!isMac || maximized) {
-    await page.locator('[data-testid="window-maximize"]').click({ force: true });
-    await page.waitForTimeout(500);
-    restored = await app.evaluate(
-      ({ BrowserWindow }) => !(BrowserWindow.getAllWindows()[0]?.isMaximized() ?? true)
-    );
-  }
-  await restoreAndFocus();
-
-  const appClosePromise = app.waitForEvent("close", { timeout: 5000 })
-    .then(() => true)
-    .catch(() => false);
-  const windowClosePromise = page.waitForEvent("close", { timeout: 5000 })
-    .then(() => true)
-    .catch(() => false);
-  await page.locator('[data-testid="window-close"]').click({ force: true });
-  const [appClosedByButton, windowClosedByButton] = await Promise.all([
-    appClosePromise,
-    windowClosePromise,
-  ]);
-  const remainingWindows = appClosedByButton
-    ? 0
-    : await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length)
-      .catch(() => 0);
-  const closed = appClosedByButton || windowClosedByButton || remainingWindows === 0;
-  appClosed = appClosedByButton;
-
-  const result = {
-    controls,
-    minimized,
-    maximized,
-    restored,
-    closed,
-    appClosedByButton,
-    windowClosedByButton,
-    remainingWindows,
-  };
-  console.log(JSON.stringify(result, null, 2));
-
-  const failed = controls.some((count) => count !== 1) ||
-    !minimized ||
-    (!isMac && (!maximized || !restored)) ||
-    !closed;
-
-  if (failed) {
-    process.exitCode = 1;
+  if (process.platform !== "darwin") {
+    await page.locator('[data-testid="window-maximize"]').click();
+    await page.waitForTimeout(300);
+    assert.equal(await second.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.isMaximized()), true);
   }
 } finally {
-  if (!appClosed) {
-    await app.close().catch(() => {});
-  }
+  await second.close();
 }
+
+console.log(JSON.stringify({ executablePath, version: expectedVersion, persistence: true }, null, 2));

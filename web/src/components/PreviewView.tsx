@@ -3,8 +3,9 @@ import { useAppStore } from "../store";
 import { downloadHTML, toggleFavorite, saveCssOverrides, editStream } from "../api";
 import {
   fixBareHexColors,
+  INTERACTIVE_IFRAME_SANDBOX,
   INSPECT_IFRAME_SANDBOX,
-  PREVIEW_IFRAME_SANDBOX,
+  requiresInteractivePreview,
 } from "./html-utils";
 import LineageView from "./LineageView";
 import AnimationPlayground from "./AnimationPlayground";
@@ -95,9 +96,15 @@ export default function PreviewView() {
     generations,
     toggleFavorite: toggleFav,
     enterEditMode,
-    addGeneration,
     startGeneration,
     endGeneration,
+    addPlaceholders,
+    replacePlaceholder,
+    removeStreamingVariant,
+    appendChunk,
+    finalizeVariant,
+    errorVariant,
+    registerRun,
   } =
     useAppStore();
   const [viewportIdx, setViewportIdx] = useState(4);
@@ -116,20 +123,29 @@ export default function PreviewView() {
   const [directStatus, setDirectStatus] = useState<string | null>(null);
   const [directError, setDirectError] = useState<string | null>(null);
   const [directBusy, setDirectBusy] = useState(false);
+  const [previewMode, setPreviewMode] = useState<"static" | "interactive">("static");
   const iframeRef = useRef<HTMLIFrameElement>(null);
 
   const generation = generations.find((g) => g.id === selectedId);
   const [cssOverrides, setCssOverrides] = useState(generation?.css_overrides || "");
 
-  // Listen for component extraction messages from iframe
+  const legacyRuntime = requiresInteractivePreview(generation?.parsed_html || "");
+
   useEffect(() => {
-    if (!extractMode) return;
-    const handler = async (e: MessageEvent) => {
-      if (e.data?.type !== "motif-extract" || !e.data.html) return;
+    setPreviewMode(legacyRuntime ? "interactive" : "static");
+  }, [generation?.id, legacyRuntime]);
+
+  // Component extraction stays parent-owned in same-origin static mode.
+  useEffect(() => {
+    if (!extractMode || previewMode !== "static") return;
+    const iframe = iframeRef.current;
+    let attached: Document | null = null;
+    let hovered: Element | null = null;
+    const save = async (element: Element) => {
       try {
         await saveComponent({
           name: `Component ${new Date().toLocaleTimeString()}`,
-          html: e.data.html,
+          html: element.outerHTML,
           source_generation_id: selectedId || "",
           genome_id: generation?.genome_id || "",
         });
@@ -140,11 +156,45 @@ export default function PreviewView() {
         setTimeout(() => setExtractStatus(null), 2000);
       }
     };
-    window.addEventListener("message", handler);
-    return () => window.removeEventListener("message", handler);
-  }, [extractMode, selectedId, generation?.genome_id]);
+    const over = (event: MouseEvent) => {
+      if (!(event.target instanceof Element)) return;
+      hovered?.classList.remove("motif-extract-hover");
+      hovered = event.target;
+      hovered.classList.add("motif-extract-hover");
+    };
+    const out = () => hovered?.classList.remove("motif-extract-hover");
+    const click = (event: MouseEvent) => {
+      if (!(event.target instanceof Element)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      void save(event.target);
+    };
+    const attach = () => {
+      const doc = iframe?.contentDocument;
+      if (!doc?.head || !doc.body || attached === doc) return;
+      const style = doc.createElement("style");
+      style.id = "motif-extract-style";
+      style.textContent = ".motif-extract-hover{outline:2px solid rgba(6,182,212,.7)!important;outline-offset:2px!important;cursor:crosshair!important}";
+      doc.head.appendChild(style);
+      doc.addEventListener("mouseover", over, true);
+      doc.addEventListener("mouseout", out, true);
+      doc.addEventListener("click", click, true);
+      attached = doc;
+    };
+    iframe?.addEventListener("load", attach);
+    const timer = window.setTimeout(attach, 50);
+    return () => {
+      window.clearTimeout(timer);
+      iframe?.removeEventListener("load", attach);
+      attached?.getElementById("motif-extract-style")?.remove();
+      attached?.removeEventListener("mouseover", over, true);
+      attached?.removeEventListener("mouseout", out, true);
+      attached?.removeEventListener("click", click, true);
+    };
+  }, [extractMode, previewMode, selectedId, generation?.genome_id]);
 
-  // Set srcDoc via ref so viewport changes don't reload the iframe
+  // Static srcdoc inherits the app CSP. Interactive documents use a dedicated
+  // token-gated response with their own runtime CSP and an opaque iframe origin.
   useEffect(() => {
     if (iframeRef.current && generation) {
       const html = fixBareHexColors(generation.parsed_html);
@@ -152,9 +202,17 @@ export default function PreviewView() {
       const injected = html.includes('</body>')
         ? html.replace('</body>', LINK_INTERCEPT + '</body>')
         : html + LINK_INTERCEPT;
-      iframeRef.current.srcdoc = injected;
+      if (previewMode === "interactive") {
+        iframeRef.current.removeAttribute("srcdoc");
+        const token = window.motifDesktop?.getPreviewToken();
+        const query = token ? `?token=${encodeURIComponent(token)}` : "";
+        iframeRef.current.src = `/interactive/${encodeURIComponent(generation.id)}${query}`;
+      } else {
+        iframeRef.current.removeAttribute("src");
+        iframeRef.current.srcdoc = injected;
+      }
     }
-  }, [directEditMode, extractMode, generation, showCssEditor]);
+  }, [directEditMode, extractMode, generation, previewMode, showCssEditor]);
 
   useEffect(() => {
     if (!directEditMode) return;
@@ -277,9 +335,9 @@ export default function PreviewView() {
 
   const vp = VIEWPORTS[viewportIdx];
   const isFull = vp.width === 0;
-  const iframeSandbox = extractMode || showCssEditor || directEditMode
-    ? INSPECT_IFRAME_SANDBOX
-    : PREVIEW_IFRAME_SANDBOX;
+  const iframeSandbox = previewMode === "interactive"
+    ? INTERACTIVE_IFRAME_SANDBOX
+    : INSPECT_IFRAME_SANDBOX;
 
   const handleExport = () => {
     downloadHTML(
@@ -305,6 +363,9 @@ export default function PreviewView() {
     setDirectError(null);
     setDirectStatus("Starting localized edit...");
     startGeneration();
+    const placeholderIds = addPlaceholders(1, generation.motif_id || undefined);
+    const placeholderQueue = [...placeholderIds];
+    const signal = registerRun(placeholderIds, () => void handleDirectEdit());
     try {
       await editStream(
         {
@@ -313,10 +374,17 @@ export default function PreviewView() {
           target: directTarget,
         },
         {
-          onVariantStart: () => setDirectStatus("Editing selected element..."),
-          onVariantChunk: () => setDirectStatus("Streaming edited fork..."),
+          onVariantStart: (id, expandedPrompt) => {
+            const placeholder = placeholderQueue.shift();
+            if (placeholder) replacePlaceholder(placeholder, id, expandedPrompt);
+            setDirectStatus("Editing selected element...");
+          },
+          onVariantChunk: (id, chunk) => {
+            appendChunk(id, chunk);
+            setDirectStatus("Streaming edited fork...");
+          },
           onVariantDone: (next) => {
-            addGeneration(next);
+            finalizeVariant(next.id, next);
             setSelectedId(next.id);
             setDirectInstruction("");
             setDirectTarget(null);
@@ -325,6 +393,7 @@ export default function PreviewView() {
             window.setTimeout(() => setDirectStatus(null), 2000);
           },
           onVariantError: (_id, error) => {
+            errorVariant(_id, error);
             setDirectError(error);
             setDirectStatus(null);
           },
@@ -332,12 +401,14 @@ export default function PreviewView() {
             setDirectError(error);
             setDirectStatus(null);
           },
-        }
+        },
+        signal
       );
     } catch (err) {
       setDirectError(err instanceof Error ? err.message : "Direct edit failed");
       setDirectStatus(null);
     } finally {
+      placeholderQueue.forEach(removeStreamingVariant);
       setDirectBusy(false);
       endGeneration();
     }
@@ -346,7 +417,7 @@ export default function PreviewView() {
   return (
     <div className="flex-1 flex flex-col overflow-hidden pt-4">
       {/* Toolbar */}
-      <div className="flex items-center justify-between px-4 py-2.5 border-b border-white/10">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 border-b border-white/10">
         <div className="flex items-center gap-3">
           <button
             onClick={handleBack}
@@ -358,6 +429,28 @@ export default function PreviewView() {
           <span className="text-sm text-white/50 truncate max-w-sm">
             {generation.prompt}
           </span>
+        </div>
+
+        <div className="flex items-center gap-1 rounded-lg bg-white/5 p-1" aria-label="Preview mode">
+          <button
+            type="button"
+            onClick={() => setPreviewMode("static")}
+            className={`rounded-md px-2.5 py-1.5 text-xs ${previewMode === "static" ? "bg-emerald-500/15 text-emerald-200" : "text-white/40"}`}
+          >
+            Safe
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setDirectEditMode(false);
+              setExtractMode(false);
+              setShowCssEditor(false);
+              setPreviewMode("interactive");
+            }}
+            className={`rounded-md px-2.5 py-1.5 text-xs ${previewMode === "interactive" ? "bg-amber-500/15 text-amber-200" : "text-white/40"}`}
+          >
+            Interactive
+          </button>
         </div>
 
         {/* Viewport switcher */}
@@ -379,7 +472,7 @@ export default function PreviewView() {
           ))}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           {!isFull && (
             <span className="text-xs text-white/30 hidden sm:inline">
               {vp.width} x {vp.height}
@@ -414,6 +507,7 @@ export default function PreviewView() {
           </button>
           <button
             onClick={() => setShowResponsive(true)}
+            disabled={previewMode !== "static"}
             className="p-2 rounded-lg transition hover:bg-white/10 text-white/50"
             title="Responsive check"
           >
@@ -421,6 +515,7 @@ export default function PreviewView() {
           </button>
           <button
             onClick={() => setShowPlayground(true)}
+            disabled={previewMode !== "static"}
             className="p-2 rounded-lg transition hover:bg-white/10 text-white/50"
             title="Animation playground"
           >
@@ -446,6 +541,7 @@ export default function PreviewView() {
             className={`p-2 rounded-lg transition ${
               directEditMode ? "bg-emerald-500/15 text-emerald-300" : "hover:bg-white/10 text-white/50"
             }`}
+            disabled={previewMode !== "static"}
             title={directEditMode ? "Exit direct edit mode" : "Direct element edit"}
             aria-label={directEditMode ? "Exit direct edit mode" : "Direct element edit"}
           >
@@ -453,79 +549,18 @@ export default function PreviewView() {
           </button>
           <button
             onClick={() => {
-              setExtractMode(!extractMode);
+              setExtractMode((value) => !value);
               if (!extractMode) {
                 setDirectEditMode(false);
                 setDirectTarget(null);
-              }
-              if (!extractMode) {
                 setExtractStatus(null);
-                // Inject extraction script into iframe
-                try {
-                  const doc = iframeRef.current?.contentDocument;
-                  if (doc) {
-                    // Remove previous extraction listeners
-                    const prev = doc.getElementById("motif-extract-script");
-                    if (prev) prev.remove();
-                    const prevStyle = doc.getElementById("motif-extract-style");
-                    if (prevStyle) prevStyle.remove();
-
-                    // Add hover highlight style
-                    const style = doc.createElement("style");
-                    style.id = "motif-extract-style";
-                    style.textContent = `
-                      .motif-extract-hover {
-                        outline: 2px solid rgba(6, 182, 212, 0.6) !important;
-                        outline-offset: 2px !important;
-                        cursor: crosshair !important;
-                      }
-                    `;
-                    doc.head.appendChild(style);
-
-                    // Add hover/click handlers
-                    const script = doc.createElement("script");
-                    script.id = "motif-extract-script";
-                    script.textContent = `
-                      (function() {
-                        let hovered = null;
-                        document.addEventListener('mouseover', function(e) {
-                          if (hovered) hovered.classList.remove('motif-extract-hover');
-                          hovered = e.target;
-                          hovered.classList.add('motif-extract-hover');
-                        });
-                        document.addEventListener('mouseout', function(e) {
-                          e.target.classList.remove('motif-extract-hover');
-                        });
-                        document.addEventListener('click', function(e) {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          const el = e.target;
-                          el.classList.remove('motif-extract-hover');
-                          const html = el.outerHTML;
-                          window.parent.postMessage({ type: 'motif-extract', html: html }, '*');
-                        }, true);
-                      })();
-                    `;
-                    doc.body.appendChild(script);
-                  }
-                } catch { /* sandbox */ }
-              } else {
-                // Cleanup extraction mode
-                try {
-                  const doc = iframeRef.current?.contentDocument;
-                  if (doc) {
-                    const s = doc.getElementById("motif-extract-script");
-                    if (s) s.remove();
-                    const st = doc.getElementById("motif-extract-style");
-                    if (st) st.remove();
-                  }
-                } catch { /* sandbox */ }
               }
             }}
             className={`p-2 rounded-lg transition ${
               extractMode ? "bg-cyan-500/15 text-cyan-400" : "hover:bg-white/10 text-white/50"
             }`}
-            title={extractMode ? "Exit extract mode" : "Extract component"}
+            disabled={previewMode !== "static"}
+            title={previewMode === "static" ? (extractMode ? "Exit extract mode" : "Extract component") : "Inspection is unavailable in interactive mode"}
           >
             <i className="bi bi-scissors" />
           </button>
@@ -545,6 +580,7 @@ export default function PreviewView() {
           </button>
           <button
             onClick={() => setShowCssEditor(!showCssEditor)}
+            disabled={previewMode !== "static"}
             className={`p-2 rounded-lg transition ${showCssEditor ? "bg-white/15 text-white" : "hover:bg-white/10 text-white/50"}`}
             title="CSS tweaks"
           >
@@ -566,6 +602,14 @@ export default function PreviewView() {
           </button>
         </div>
       </div>
+
+      {previewMode === "interactive" && (
+        <div className="shrink-0 border-b border-amber-500/20 bg-amber-500/[0.08] px-4 py-2 text-xs text-amber-200/75" role="status">
+          <i className="bi bi-shield-exclamation mr-2" />
+          Scripts are enabled in an opaque sandbox. Motif cannot inspect, edit, or call APIs from this preview.
+          {legacyRuntime && " This legacy CDN generation must be regenerated for Safe inspection."}
+        </div>
+      )}
 
       {/* Extract mode banner */}
       {extractMode && (

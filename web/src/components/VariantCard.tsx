@@ -13,10 +13,12 @@ import {
   updateGenerationBoard,
   downloadHandoffZip,
   extractStylePatch,
+  fetchGeneration,
   type BlendEntry,
   type QualityScore,
 } from "../api";
 import VaryPopup from "./VaryPopup";
+import ConfirmDialog from "./ConfirmDialog";
 import {
   VIEWPORT_WIDTH,
   measureContentSize,
@@ -26,7 +28,7 @@ import {
 } from "./thumbnail-utils";
 import { dropperMouse, textureCache, setDropperHoveredEl } from "../shaders/dropper-shared";
 
-import { fixBareHexColors, PREVIEW_IFRAME_SANDBOX } from "./html-utils";
+import { fixBareHexColors, INTERACTIVE_IFRAME_SANDBOX, PREVIEW_IFRAME_SANDBOX, requiresInteractivePreview } from "./html-utils";
 
 interface Props {
   generation: Generation;
@@ -45,6 +47,7 @@ export default memo(function VariantCard({ generation }: Props) {
   const toggleFav = useAppStore((s) => s.toggleFavorite);
   const removeGeneration = useAppStore((s) => s.removeGeneration);
   const setSelectedId = useAppStore((s) => s.setSelectedId);
+  const selectGeneration = useAppStore((s) => s.selectGeneration);
   const styleDropperMode = useAppStore((s) => s.styleDropperMode);
   const styleSourceId = useAppStore((s) => s.styleSourceId);
   const enterDropperMode = useAppStore((s) => s.enterDropperMode);
@@ -53,7 +56,10 @@ export default memo(function VariantCard({ generation }: Props) {
   const setDropperHover = useAppStore((s) => s.setDropperHover);
   const startGeneration = useAppStore((s) => s.startGeneration);
   const endGeneration = useAppStore((s) => s.endGeneration);
-  const addStreamingVariant = useAppStore((s) => s.addStreamingVariant);
+  const addPlaceholders = useAppStore((s) => s.addPlaceholders);
+  const replacePlaceholder = useAppStore((s) => s.replacePlaceholder);
+  const removeStreamingVariant = useAppStore((s) => s.removeStreamingVariant);
+  const registerRun = useAppStore((s) => s.registerRun);
   const appendChunk = useAppStore((s) => s.appendChunk);
   const finalizeVariant = useAppStore((s) => s.finalizeVariant);
   const errorVariant = useAppStore((s) => s.errorVariant);
@@ -70,6 +76,8 @@ export default memo(function VariantCard({ generation }: Props) {
   );
   const [workflowBusy, setWorkflowBusy] = useState<string | null>(null);
   const [workflowNote, setWorkflowNote] = useState<string | null>(null);
+  const [thumbnailFailed, setThumbnailFailed] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   useEffect(() => {
     setBoardStatus(generation.board_status || "candidate");
@@ -112,7 +120,19 @@ export default memo(function VariantCard({ generation }: Props) {
     return () => observer.disconnect();
   }, []);
 
+  useEffect(() => {
+    if (!isVisible || generation.parsed_html) return;
+    void fetchGeneration(generation.id)
+      .then((full) => updateGenerationFields(generation.id, full))
+      .catch(() => {});
+  }, [isVisible, generation.id, generation.parsed_html, updateGenerationFields]);
+
   const isStyleSource = styleDropperMode && styleSourceId === generation.id;
+  const interactivePreview = requiresInteractivePreview(generation.parsed_html);
+  const previewToken = interactivePreview ? window.motifDesktop?.getPreviewToken() : "";
+  const previewSrc = interactivePreview
+    ? `/interactive/${encodeURIComponent(generation.id)}${previewToken ? `?token=${encodeURIComponent(previewToken)}` : ""}`
+    : undefined;
 
   const handleDropperMouseEnter = useCallback(() => {
     if (!styleDropperMode || isStyleSource) return;
@@ -262,6 +282,7 @@ export default memo(function VariantCard({ generation }: Props) {
 
             // Persist to DB as WebP data URL (fire-and-forget)
             const dataUrl = cropped.toDataURL("image/webp", 0.7);
+            updateGenerationFields(generation.id, { thumbnail: dataUrl });
             saveThumbnail(generation.id, dataUrl).catch(() => {});
           }
         } catch {
@@ -280,7 +301,7 @@ export default memo(function VariantCard({ generation }: Props) {
       if (timer) clearTimeout(timer);
       iframe.removeEventListener("load", handleLoad);
     };
-  }, [isVisible, generation.id, generation.parsed_html, generation.thumbnail]);
+  }, [isVisible, generation.id, generation.parsed_html, generation.thumbnail, updateGenerationFields]);
 
   // For mobile-first designs, zoom in moderately and center the content band
   const desktopScale = containerWidth / VIEWPORT_WIDTH;
@@ -322,8 +343,7 @@ export default memo(function VariantCard({ generation }: Props) {
 
   const handleDelete = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    removeGeneration(generation.id);
-    await deleteGeneration(generation.id);
+    setConfirmDelete(true);
   };
 
   const handleExport = (e: React.MouseEvent) => {
@@ -416,9 +436,11 @@ export default memo(function VariantCard({ generation }: Props) {
     setShowVaryPopup(true);
   };
 
-  const executeReorganize = async (e: React.MouseEvent) => {
-    e.stopPropagation();
+  const runReorganize = async () => {
     startGeneration();
+    const placeholderIds = addPlaceholders(1, generation.motif_id || activeMotifId || undefined);
+    const placeholderQueue = [...placeholderIds];
+    const signal = registerRun(placeholderIds, () => void runReorganize());
     try {
       await reorganizeStream(
         {
@@ -426,21 +448,34 @@ export default memo(function VariantCard({ generation }: Props) {
           motifId: activeMotifId || undefined,
         },
         {
-          onVariantStart: (id, expandedPrompt) => addStreamingVariant(id, expandedPrompt),
+          onVariantStart: (id, expandedPrompt) => {
+            const placeholder = placeholderQueue.shift();
+            if (placeholder) replacePlaceholder(placeholder, id, expandedPrompt);
+          },
           onVariantChunk: (id, chunk) => appendChunk(id, chunk),
           onVariantDone: (gen) => finalizeVariant(gen.id, gen),
           onVariantError: (id, err) => errorVariant(id, err),
-        }
+        },
+        signal
       );
     } catch (err) {
       console.error("Reorganize failed:", err);
     } finally {
+      placeholderQueue.forEach(removeStreamingVariant);
       endGeneration();
     }
   };
 
+  const executeReorganize = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    void runReorganize();
+  };
+
   const executeStyleDrop = async (contentId: string, styleId: string) => {
     startGeneration();
+    const placeholderIds = addPlaceholders(1, generation.motif_id || activeMotifId || undefined);
+    const placeholderQueue = [...placeholderIds];
+    const signal = registerRun(placeholderIds, () => void executeStyleDrop(contentId, styleId));
     try {
       await styleDropStream(
         {
@@ -449,15 +484,20 @@ export default memo(function VariantCard({ generation }: Props) {
           motifId: activeMotifId || undefined,
         },
         {
-          onVariantStart: (id, expandedPrompt) => addStreamingVariant(id, expandedPrompt),
+          onVariantStart: (id, expandedPrompt) => {
+            const placeholder = placeholderQueue.shift();
+            if (placeholder) replacePlaceholder(placeholder, id, expandedPrompt);
+          },
           onVariantChunk: (id, chunk) => appendChunk(id, chunk),
           onVariantDone: (gen) => finalizeVariant(gen.id, gen),
           onVariantError: (id, err) => errorVariant(id, err),
-        }
+        },
+        signal
       );
     } catch (err) {
       console.error("Style drop failed:", err);
     } finally {
+      placeholderQueue.forEach(removeStreamingVariant);
       endGeneration();
     }
   };
@@ -473,7 +513,7 @@ export default memo(function VariantCard({ generation }: Props) {
       executeStyleDrop(generation.id, styleSourceId);
       exitDropperMode();
     } else {
-      setSelectedId(generation.id);
+      void selectGeneration(generation.id).catch(() => setSelectedId(generation.id));
     }
   };
 
@@ -506,6 +546,16 @@ export default memo(function VariantCard({ generation }: Props) {
       onMouseEnter={handleDropperMouseEnter}
       onMouseLeave={handleDropperMouseLeave}
       onMouseMove={handleDropperMouseMove}
+      role="button"
+      tabIndex={0}
+      aria-label={`Open generation ${generation.prompt || generation.id.slice(0, 8)}`}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return;
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          handleCardClick();
+        }
+      }}
     >
       {/* Preview iframe — scaled from full viewport width */}
       <div
@@ -515,11 +565,19 @@ export default memo(function VariantCard({ generation }: Props) {
         className="bg-[#0a0a0a] overflow-hidden relative"
         style={{ height: displayHeight, transition: "height 0.4s cubic-bezier(0.25, 0.1, 0.25, 1)" }}
       >
-        {isVisible ? (
+        {generation.thumbnail && !thumbnailFailed ? (
+          <img
+            src={generation.thumbnail}
+            alt=""
+            className="h-full w-full object-cover"
+            onError={() => setThumbnailFailed(true)}
+          />
+        ) : isVisible && generation.parsed_html ? (
           <iframe
             ref={iframeRef}
-            srcDoc={fixBareHexColors(generation.parsed_html)}
-            sandbox={PREVIEW_IFRAME_SANDBOX}
+            src={previewSrc}
+            srcDoc={interactivePreview ? undefined : fixBareHexColors(generation.parsed_html)}
+            sandbox={interactivePreview ? INTERACTIVE_IFRAME_SANDBOX : PREVIEW_IFRAME_SANDBOX}
             style={{
               width: VIEWPORT_WIDTH,
               height: VIEWPORT_WIDTH / aspect,
@@ -674,7 +732,7 @@ export default memo(function VariantCard({ generation }: Props) {
       )}
 
       {/* Hover actions */}
-      <div className="absolute top-2 left-2 right-2 z-20 flex items-center justify-between gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+      <div className="absolute top-2 left-2 right-2 z-20 flex items-center justify-between gap-2 opacity-100 md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 transition-opacity">
         <div className="flex gap-1">
           <button
             onClick={handleFavorite}
@@ -749,6 +807,20 @@ export default memo(function VariantCard({ generation }: Props) {
           onClose={() => setShowVaryPopup(false)}
         />
       )}
+      <ConfirmDialog
+        open={confirmDelete}
+        title="Delete generation?"
+        confirmLabel="Delete"
+        danger
+        onClose={() => setConfirmDelete(false)}
+        onConfirm={async () => {
+          await deleteGeneration(generation.id);
+          removeGeneration(generation.id);
+          setConfirmDelete(false);
+        }}
+      >
+        This cannot be undone.
+      </ConfirmDialog>
     </div>
   );
 });

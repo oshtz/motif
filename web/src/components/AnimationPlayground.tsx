@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import type { Generation } from "../store";
+import { STATIC_IFRAME_SANDBOX } from "./html-utils";
 
 const STATES = [
   { label: "Hover", pseudo: "hover", icon: "bi-cursor" },
@@ -297,7 +298,7 @@ export default function AnimationPlayground({ generation, onClose }: Props) {
         <iframe
           ref={iframeRef}
           srcDoc={generation.parsed_html}
-          sandbox="allow-scripts allow-same-origin"
+          sandbox={STATIC_IFRAME_SANDBOX}
           onLoad={handleLoad}
           className="w-full h-full border-0 rounded-xl bg-white"
           title="Animation playground preview"

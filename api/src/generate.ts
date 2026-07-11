@@ -1,4 +1,4 @@
-import { v4 as uuid } from "uuid";
+import { randomUUID } from "crypto";
 import {
   composeSystemPrompt,
   composeShuffleSystemPrompt,
@@ -31,6 +31,7 @@ export interface Generation {
   notes?: string;
   quality_score_json?: string;
   style_patch_id?: string;
+  pricing_metadata_json?: string;
 }
 
 export const DEFAULT_EDIT_PROMPT = `You are an expert UI editor. You receive an existing HTML document and an edit instruction.
@@ -43,7 +44,7 @@ Apply the requested edit to the HTML while preserving:
 Rules:
 - Make ONLY the changes described in the edit instruction
 - Keep the result as a complete, self-contained HTML document
-- Include Tailwind CSS via CDN script tag
+- Include all required CSS in a <style> element; do not use Tailwind, external stylesheets, or runtime CSS frameworks
 - Return ONLY the complete HTML document`;
 
 export const DEFAULT_STYLE_DROPPER_PROMPT = `You are an expert UI restyling engine. You receive two HTML documents:
@@ -58,10 +59,10 @@ Rules:
 - Do NOT change content, text, or layout structure
 - Do NOT add or remove components
 - ONLY change visual styling
-- Include Tailwind CSS via CDN script tag
+- Include all required CSS in a <style> element; do not use Tailwind, external stylesheets, or runtime CSS frameworks
 - Return ONLY the complete HTML document`;
 
-export const RAW_COMPARE_PROMPT = `You are a frontend developer. Generate a complete, self-contained HTML page with inline CSS and JS based on the user's description. Use Tailwind CSS via CDN. Make it visually polished and production-quality. Return ONLY the HTML code.`;
+export const RAW_COMPARE_PROMPT = `You are a frontend developer. Generate a complete, self-contained HTML page based on the user's description. Include all required CSS in a <style> element and do not use Tailwind, external stylesheets, or runtime CSS frameworks. Make it visually polished and production-quality. Return ONLY the HTML code.`;
 
 export const DEFAULT_REORGANIZE_PROMPT = `You are an expert UI layout architect. You receive an existing HTML document and must produce a layout variation.
 
@@ -86,7 +87,7 @@ Rules:
 - Make a SUBSTANTIALLY different layout — not just minor spacing tweaks
 - The result must look like a genuine alternative layout exploration
 - Keep the result as a complete, self-contained HTML document
-- Include Tailwind CSS via CDN script tag
+- Include all required CSS in a <style> element; do not use Tailwind, external stylesheets, or runtime CSS frameworks
 - Return ONLY the complete HTML document`;
 
 export function getDefaultSystemPrompt(): string {
@@ -113,19 +114,10 @@ export function extractHTML(raw: string): string {
 }
 
 export function wrapHTML(html: string): string {
-  // If the generated HTML is already a complete document, inject Tailwind CDN
-  // into its <head> instead of re-wrapping (which would override its own styles)
+  // Complete generations already own their styling; legacy CDN output remains
+  // readable and is isolated by the frontend's Interactive mode.
   const isFullDocument = /<!DOCTYPE|<html/i.test(html);
-  if (isFullDocument) {
-    // Inject Tailwind CDN if not already present
-    if (!html.includes('cdn.tailwindcss.com')) {
-      html = html.replace(
-        /<head([^>]*)>/i,
-        `<head$1>\n  <script src="https://cdn.tailwindcss.com"><\/script>`
-      );
-    }
-    return html;
-  }
+  if (isFullDocument) return html;
 
   // For HTML fragments, wrap in a minimal document
   return `<!DOCTYPE html>
@@ -133,7 +125,6 @@ export function wrapHTML(html: string): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body>
   ${html}
@@ -322,8 +313,9 @@ export function streamVariant(options: {
   history?: ConversationTurn[]; // prior turns in this motif thread
   curatedImages?: string; // pre-searched image URLs block to inject
   stylePatchPrompt?: string; // reusable Style Dropper patch prompt
+  signal?: AbortSignal;
 }): { response: Promise<Response> } {
-  const { expandedPrompt, genomeId, secondaryGenomeId, blendConfig, model, temperature, provider, customSystemPrompt, history, curatedImages, stylePatchPrompt } = options;
+  const { expandedPrompt, genomeId, secondaryGenomeId, blendConfig, model, temperature, provider, customSystemPrompt, history, curatedImages, stylePatchPrompt, signal } = options;
 
   // Use custom system prompt if provided, otherwise compose from genome(s)
   let systemPrompt: string;
@@ -378,7 +370,7 @@ export function streamVariant(options: {
     messages,
     temperature,
     stream: true,
-  });
+  }, signal);
 
   const response = fetch(url, init);
 
@@ -386,5 +378,5 @@ export function streamVariant(options: {
 }
 
 export function newVariantId(): string {
-  return uuid();
+  return randomUUID();
 }

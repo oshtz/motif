@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback } from "react";
 import type { Generation } from "../store";
+import { STATIC_IFRAME_SANDBOX } from "./html-utils";
 
 const VIEWPORTS = [
   { label: "Mobile", width: 375, height: 667 },
@@ -242,7 +243,7 @@ export default function ResponsiveChecker({ generation, onClose }: Props) {
                   <iframe
                     ref={(el) => { iframeRefs.current[i] = el; }}
                     srcDoc={generation.parsed_html}
-                    sandbox="allow-scripts allow-same-origin"
+                    sandbox={STATIC_IFRAME_SANDBOX}
                     onLoad={() => checkViewport(i)}
                     style={{
                       width: vp.width,

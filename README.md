@@ -16,7 +16,21 @@
   </a>
 </p>
 
-Motif generates production-grade, single-file HTML interfaces from natural language prompts. Instead of generic templates, every output is shaped by a **genome** — a complete design philosophy defining colors, typography, spacing, motion, editorial voice, and anti-patterns. The result is UI that feels intentionally designed, not AI-generated.
+Motif generates single-file HTML interface drafts from natural language prompts. Instead of a fixed template, every output is shaped by a **genome** — a design direction defining colors, typography, spacing, motion, editorial voice, and anti-patterns. Generated output should still be reviewed and tested before production use.
+
+## Download Desktop App
+
+Download the latest desktop builds from [GitHub Releases](https://github.com/oshtz/motif/releases/latest).
+
+Use one of these files:
+
+| Platform | File |
+| --- | --- |
+| Windows installer | `Motif-*-Setup.exe` |
+| Windows portable | `Motif-*-Portable.exe` |
+| macOS | `Motif-*-arm64.dmg` for Apple Silicon, `Motif-*-x64.dmg` for Intel |
+
+The other files attached to each release are updater metadata and integrity files. Motif keeps projects and settings on the local device by default; prompts and inputs are sent to the provider you configure. See [Security and Privacy](docs/security-privacy.md).
 
 ## Features
 
@@ -215,7 +229,7 @@ motif/
 
 ### Prerequisites
 
-- **Node.js** 18+
+- **Node.js** 22
 - An LLM provider — one of:
   - **OpenRouter** API key ([openrouter.ai](https://openrouter.ai)) — access to Claude, GPT-4, Gemini, etc.
   - **Ollama** running locally ([ollama.com](https://ollama.com)) — free, fully offline
@@ -226,7 +240,7 @@ motif/
 ```bash
 git clone https://github.com/oshtz/motif.git
 cd motif
-npm install        # installs root + api + web dependencies automatically
+npm install        # installs the npm workspaces from the root lockfile
 ```
 
 ### Run
@@ -287,7 +301,7 @@ Open the app and click the <kbd>gear</kbd> icon to set:
 - **Shuffle** — blend two genomes per variant
 - **Custom System Prompt** — bypass the genome system entirely
 
-All configuration is stored locally in the SQLite database — no `.env` files needed.
+Configuration is stored locally. Desktop provider credentials use OS-backed encryption; standalone browser/API development stores them in the local SQLite database. No provider credentials are bundled with Motif.
 
 ## API Endpoints
 
@@ -376,52 +390,11 @@ cd api && npm run build    # → api/dist/
 cd api && npm start        # Production server
 ```
 
-## Desktop Packaging
+## Desktop Release
 
-Motif can also be packaged as an Electron desktop app without changing the web/API architecture.
+Motif ships as an Electron desktop app for Windows and macOS. Maintainer packaging, signing, notarization, and updater details are documented in [docs/desktop-release.md](docs/desktop-release.md).
 
-```bash
-npm run desktop:dev        # build web/API, then open Electron locally
-npm run desktop:pack       # unpacked desktop build for smoke testing
-npm run desktop:dist:win   # Windows NSIS installer, portable EXE, and updater zip/assets
-npm run desktop:dist:mac   # macOS DMG + updater zip/assets (run on macOS)
-```
-
-The desktop runtime starts the existing Express API inside Electron, stores `motif.db` under the app data directory, and loads the built Vite app. `.github/workflows/desktop-release.yml` packages Windows and macOS artifacts on manual dispatch and publishes GitHub Release updater assets only for `v*` tags.
-
-Windows builds include two distribution paths:
-
-- Installed app: uses Electron's normal NSIS updater and `latest.yml`.
-- Portable EXE: checks the latest GitHub Release for `Motif-*-Portable.exe`, verifies it against `SHA256SUMS-windows.txt`, closes Motif, replaces the current portable EXE, and reopens it. This path is Windows-only and requires write access to the folder containing the portable EXE.
-
-Both Windows paths use Electron's user data directory for `motif.db`, so the installed app and portable EXE share the same local database for the same Windows user.
-
-### Desktop Release Secrets
-
-macOS DMG distribution requires signed and notarized artifacts. Add these GitHub Actions repository secrets:
-
-| Secret | Purpose |
-| --- | --- |
-| `MAC_CSC_LINK` | Base64-encoded Developer ID Application `.p12` certificate |
-| `MAC_CSC_PASSWORD` | Password for the `.p12` certificate |
-| `APPLE_ID` | Apple ID email used for notarization |
-| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for the Apple ID |
-| `APPLE_TEAM_ID` | 10-character Apple Developer Team ID |
-
-`MAC_CSC_KEY_PASSWORD` is also accepted for compatibility with Electron Builder naming.
-
-To create `MAC_CSC_LINK` from a local certificate export:
-
-```bash
-base64 -i DeveloperIDApplication.p12 -o DeveloperIDApplication.p12.base64
-```
-
-Windows signing is optional for the first pass. If available, add:
-
-| Secret | Purpose |
-| --- | --- |
-| `WINDOWS_CODESIGN_CERTIFICATE` | Base64-encoded Windows code-signing certificate |
-| `WINDOWS_CODESIGN_PASSWORD` | Password for the Windows code-signing certificate |
+Security boundaries and hands-on desktop checks are documented in [docs/security-privacy.md](docs/security-privacy.md) and [docs/interactive-testing.md](docs/interactive-testing.md).
 
 ## License
 

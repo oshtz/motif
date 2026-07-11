@@ -4,26 +4,32 @@
   "description": "AI-powered UI generation with design genomes",
   "author": "Omer Shatzberg",
   "private": true,
+  "workspaces": [
+    "api",
+    "web"
+  ],
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
-    "dev:web": "cd web && npm run dev",
-    "dev:api": "cd api && npm run dev",
-    "build": "cd web && npm run build && cd ../api && npm run build",
-    "desktop:dev": "npm run build && electron .",
-    "desktop:pack": "npm run build && electron-builder --dir",
-    "desktop:dist": "npm run build && electron-builder",
-    "desktop:dist:win": "npm run build && electron-builder --win",
-    "desktop:dist:mac": "npm run build && electron-builder --mac",
+    "dev:web": "npm run --workspace web dev",
+    "dev:api": "npm run --workspace api dev",
+    "build": "npm run --workspace web build && npm run --workspace api build",
+    "desktop:prepare": "electron-builder install-app-deps",
+    "desktop:dev": "npm run build && npm run desktop:prepare && electron .",
+    "desktop:pack": "npm run build && npm run desktop:prepare && electron-builder --dir",
+    "desktop:dist": "npm run build && npm run desktop:prepare && electron-builder",
+    "desktop:dist:win": "npm run build && npm run desktop:prepare && electron-builder --win",
+    "desktop:dist:mac": "npm run build && npm run desktop:prepare && electron-builder --mac",
     "desktop:smoke": "node scripts/electron-smoke.mjs",
+    "check:desktop-security": "node scripts/check-electron-security.mjs",
+    "check:release": "node scripts/check-release.mjs",
     "lint": "cd web && npm run lint",
-    "test": "npm run build && node --test tests/*.test.mjs",
+    "test": "npm run build && node --test tests/*.test.mjs && npm run --workspace api test",
     "check:genomes": "node scripts/genome-governance.mjs",
     "smoke:quality": "node scripts/browser-quality-smoke.mjs",
     "smoke:quality:ci": "node scripts/browser-quality-smoke.mjs --seed-if-empty",
     "smoke:e2e": "node scripts/e2e-workflow-smoke.mjs",
-    "start": "node api/dist/index.js",
-    "postinstall": "cd api && npm install && cd ../web && npm install"
+    "start": "npm run --workspace api start"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",
@@ -33,10 +39,8 @@
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",
-    "cors": "^2.8.6",
     "electron-updater": "^6.8.9",
-    "express": "^5.2.1",
-    "uuid": "^14.0.0"
+    "express": "^5.2.1"
   },
   "build": {
     "appId": "com.oshtz.motif",

@@ -225,7 +225,7 @@ export default function CompareView() {
       </div>
 
       {/* Side-by-side panels */}
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex flex-col overflow-auto md:flex-row md:overflow-hidden">
         <ComparePanel
           label="Raw"
           sublabel="No genome, no expansion"
@@ -233,7 +233,7 @@ export default function CompareView() {
           accentColor="neutral"
           onSave={() => handleSave(rawPanel, "raw")}
         />
-        <div className="w-px bg-white/5 shrink-0" />
+        <div className="h-px bg-white/5 shrink-0 md:h-auto md:w-px" />
         <ComparePanel
           label={genomePanel.genomeName ? `Genome: ${genomePanel.genomeName}` : "Genome"}
           sublabel="Full pipeline"
@@ -318,7 +318,7 @@ function ComparePanel({
   const scale = containerWidth / VIEWPORT_WIDTH;
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden min-w-0">
+    <div className="flex min-h-[65vh] flex-1 flex-col overflow-hidden min-w-0 md:min-h-0">
       {/* Header */}
       <div className={`shrink-0 flex items-center justify-between px-4 py-2.5 border-b ${
         accentColor === "amber" ? "border-amber-500/10 bg-amber-500/[0.03]" : "border-white/5 bg-white/[0.01]"

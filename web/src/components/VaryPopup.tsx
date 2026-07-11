@@ -21,6 +21,7 @@ export default function VaryPopup({ generationId, onClose }: VaryPopupProps) {
   const finalizeVariant = useAppStore((s) => s.finalizeVariant);
   const errorVariant = useAppStore((s) => s.errorVariant);
   const activeMotifId = useAppStore((s) => s.activeMotifId);
+  const registerRun = useAppStore((s) => s.registerRun);
 
   // Close on Escape
   useEffect(() => {
@@ -33,8 +34,9 @@ export default function VaryPopup({ generationId, onClose }: VaryPopupProps) {
 
   const handleGenerate = async () => {
     startGeneration();
-    const placeholderIds = addPlaceholders(batchSize);
+    const placeholderIds = addPlaceholders(batchSize, activeMotifId || undefined);
     const placeholderQueue = [...placeholderIds];
+    const signal = registerRun(placeholderIds, () => void handleGenerate());
     const expandedIds = new Map<string, string>();
 
     onClose();
@@ -70,7 +72,8 @@ export default function VaryPopup({ generationId, onClose }: VaryPopupProps) {
           onVariantChunk: (id, chunk) => appendChunk(id, chunk),
           onVariantDone: (gen) => finalizeVariant(gen.id, gen),
           onVariantError: (id, err) => errorVariant(id, err),
-        }
+        },
+        signal
       );
     } catch (err) {
       console.error("Vary failed:", err);
