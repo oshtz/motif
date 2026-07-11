@@ -101,7 +101,7 @@ jobs:
       - name: Generate final checksums
         shell: pwsh
         run: |
-          $files = Get-ChildItem release -File | Where-Object { $_.Extension -in ".exe", ".zip", ".blockmap", ".yml" } | Sort-Object Name
+          $files = Get-ChildItem release -File | Where-Object { $_.Extension -in ".exe", ".zip", ".blockmap" -or $_.Name -eq "latest.yml" } | Sort-Object Name
           $lines = foreach ($file in $files) {
             $hash = Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256
             "$($hash.Hash.ToLowerInvariant())  $($file.Name)"
