@@ -9,7 +9,7 @@ function verifyChecksums(platform) {
   const directory = path.join(root, platform);
   const manifestPath = path.join(directory, `SHA256SUMS-${platform}.txt`);
   const lines = fs.readFileSync(manifestPath, "utf8").trim().split(/\r?\n/);
-  assert.ok(lines.length > 1, `${platform} checksum manifest is empty`);
+  assert.ok(lines.length > 0, `${platform} checksum manifest is empty`);
   const covered = new Set();
   for (const line of lines) {
     const match = line.match(/^([a-f0-9]{64})\s+\*?(.+)$/i);
@@ -36,6 +36,5 @@ function verifyUpdaterMetadata(platform, filename) {
 
 verifyChecksums("windows");
 verifyChecksums("macos");
-verifyUpdaterMetadata("windows", "latest.yml");
 verifyUpdaterMetadata("macos", "latest-mac.yml");
 console.log("Release checksums and updater metadata verified.");

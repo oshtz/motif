@@ -14,6 +14,11 @@ assert.equal(lock.version, root.version, "package-lock.json version must match p
 assert.equal(lock.packages["api"].version, root.version);
 assert.equal(lock.packages["web"].version, root.version);
 assert.ok(!fs.existsSync("api/package-lock.json") && !fs.existsSync("web/package-lock.json"));
+assert.deepEqual(root.build.win.target, [{ target: "portable", arch: ["x64"] }]);
+assert.deepEqual(root.build.mac.target, [
+  { target: "dmg", arch: ["universal"] },
+  { target: "zip", arch: ["universal"] },
+]);
 
 const tag = process.env.GITHUB_REF?.startsWith("refs/tags/")
   ? process.env.GITHUB_REF.slice("refs/tags/".length)

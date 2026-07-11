@@ -32,13 +32,13 @@ npm run desktop:dist:mac -- --publish never
 - Windows and macOS jobs upload workflow artifacts only. One final job verifies both sets and publishes once.
 - Manual dispatch builds and verifies artifacts but does not publish a GitHub Release.
 
-User-facing assets are `Motif-*-Setup.exe`, `Motif-*-Portable.exe`, and the architecture-specific macOS DMGs. `latest.yml`, `latest-mac.yml`, zip files, blockmaps, and SHA-256 manifests support updates and verification.
+User-facing assets are `Motif-*-Portable.exe` and `Motif-*-universal.dmg`. `latest-mac.yml`, the universal macOS zip, and `SHA256SUMS-windows.txt` support updates. GitHub also adds its two source archives.
 
-The installed Windows app uses the normal Electron updater. The portable executable uses the latest GitHub Release, verifies its executable against `SHA256SUMS-windows.txt`, replaces itself, and rolls back if replacement fails. Both use the same per-user Electron data directory.
+The portable executable uses the latest GitHub Release, verifies its executable against `SHA256SUMS-windows.txt`, replaces itself, and rolls back if replacement fails. Windows installer builds ended after v0.2.0; installed users can switch to the portable executable without moving their per-user Motif data.
 
 ## Required secrets
 
-Windows artifacts are intentionally published without Authenticode signing. SHA-256 manifests and updater metadata are still verified before publication; Windows may show SmartScreen warnings, so the zip remains the lower-friction fallback.
+The Windows portable executable is intentionally published without Authenticode signing and may show SmartScreen warnings. Its SHA-256 manifest is verified before publication.
 
 macOS builds require signing and notarization credentials:
 
@@ -51,15 +51,15 @@ macOS builds require signing and notarization credentials:
 | `APPLE_APP_SPECIFIC_PASSWORD` | Apple app-specific password |
 | `APPLE_TEAM_ID` | Apple Developer Team ID |
 
-The workflow verifies Windows artifacts, updater metadata, and checksums, plus macOS code signatures, Gatekeeper assessment, notarization staples, updater metadata, and final checksums before publication.
+The workflow verifies the Windows portable executable and checksum, plus macOS universal architecture, code signatures, Gatekeeper assessment, notarization staples, updater metadata, and internal checksums before publication.
 
 ## Release procedure
 
 1. Set the same new version in all workspace package files and regenerate `package-lock.json` with `npm install --package-lock-only`.
 2. Run the local checks above and create tag `v<version>`.
 3. Push the tag. Do not create a release manually.
-4. Confirm installer, portable, unpacked app, app bundle, and DMG smoke jobs pass with isolated user-data directories.
-5. Confirm the release contains both checksum manifests and both updater metadata files.
+4. Confirm portable, unpacked app, universal app bundle, and universal DMG smoke jobs pass with isolated user-data directories on Windows, Apple Silicon, and Intel.
+5. Confirm the release has exactly five uploaded assets: portable EXE, Windows checksum, universal DMG, universal zip, and `latest-mac.yml`.
 6. Install the previous public version, update to the new version, restart, and confirm the version plus existing projects, settings, and provider credentials remain available.
 
 The last upgrade check requires real previously published artifacts and remains a manual release gate.
