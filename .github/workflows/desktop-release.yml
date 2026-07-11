@@ -121,7 +121,7 @@ jobs:
   package-macos:
     name: Signed macOS DMGs
     needs: preflight
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
@@ -182,26 +182,18 @@ jobs:
           for pattern in "release/*.dmg" "release/*.zip" "release/latest-mac.yml"; do
             compgen -G "$pattern" >/dev/null || { echo "::error::Missing $pattern"; exit 1; }
           done
-      - name: Smoke packaged apps
+      - name: Smoke arm64 packaged app
+        run: MOTIF_EXECUTABLE="release/mac-arm64/Motif.app/Contents/MacOS/Motif" MOTIF_SMOKE_USER_DATA="$RUNNER_TEMP/motif-smoke-mac-arm64" npm run desktop:smoke
+      - name: Smoke arm64 DMG
         run: |
-          index=0
-          for executable in release/mac*/Motif.app/Contents/MacOS/Motif; do
-            [ -x "$executable" ] || continue
-            MOTIF_EXECUTABLE="$executable" MOTIF_SMOKE_USER_DATA="$RUNNER_TEMP/motif-smoke-mac-$index" npm run desktop:smoke
-            index=$((index + 1))
-          done
-      - name: Smoke DMGs
-        run: |
-          index=0
-          for dmg in release/*.dmg; do
-            mount="$RUNNER_TEMP/motif-dmg-$index"
-            mkdir -p "$mount"
-            hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount"
-            cp -R "$mount/Motif.app" "$RUNNER_TEMP/Motif-$index.app"
-            hdiutil detach "$mount"
-            MOTIF_EXECUTABLE="$RUNNER_TEMP/Motif-$index.app/Contents/MacOS/Motif" MOTIF_SMOKE_USER_DATA="$RUNNER_TEMP/motif-smoke-dmg-$index" npm run desktop:smoke
-            index=$((index + 1))
-          done
+          dmg=$(compgen -G "release/Motif-*-arm64.dmg")
+          [ -f "$dmg" ] || { echo "::error::Missing arm64 DMG"; exit 1; }
+          mount="$RUNNER_TEMP/motif-dmg-arm64"
+          mkdir -p "$mount"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount"
+          cp -R "$mount/Motif.app" "$RUNNER_TEMP/Motif-arm64.app"
+          hdiutil detach "$mount"
+          MOTIF_EXECUTABLE="$RUNNER_TEMP/Motif-arm64.app/Contents/MacOS/Motif" MOTIF_SMOKE_USER_DATA="$RUNNER_TEMP/motif-smoke-dmg-arm64" npm run desktop:smoke
       - name: Generate final checksums
         run: |
           : > release/SHA256SUMS-macos.txt
@@ -220,10 +212,43 @@ jobs:
             release/latest-mac.yml
             release/SHA256SUMS-macos.txt
 
+  smoke-macos-intel:
+    name: Native Intel macOS Smoke
+    needs: package-macos
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v8
+        with:
+          name: motif-macos
+          path: release
+      - name: Verify and smoke x64 DMG
+        run: |
+          [ "$(uname -m)" = "x86_64" ] || { echo "::error::Intel smoke requires an x86_64 runner"; exit 1; }
+          dmg=$(compgen -G "release/Motif-*-x64.dmg")
+          [ -f "$dmg" ] || { echo "::error::Missing x64 DMG"; exit 1; }
+          xcrun stapler validate "$dmg"
+          mount="$RUNNER_TEMP/motif-dmg-x64"
+          mkdir -p "$mount"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount"
+          trap 'hdiutil detach "$mount"' EXIT
+          cp -R "$mount/Motif.app" "$RUNNER_TEMP/Motif-x64.app"
+          hdiutil detach "$mount"
+          trap - EXIT
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/Motif-x64.app"
+          spctl --assess --verbose --type exec "$RUNNER_TEMP/Motif-x64.app"
+          MOTIF_EXECUTABLE="$RUNNER_TEMP/Motif-x64.app/Contents/MacOS/Motif" MOTIF_SMOKE_USER_DATA="$RUNNER_TEMP/motif-smoke-dmg-x64" npm run desktop:smoke
+
   publish:
     name: Publish Complete Immutable Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [package-windows, package-macos]
+    needs: [package-windows, package-macos, smoke-macos-intel]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
