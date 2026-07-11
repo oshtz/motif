@@ -302,16 +302,20 @@ async function assertFrontendWorkflow() {
       }, null, 2));
     }
 
-    const preview = page.getByTestId("variant-preview").first();
-    await preview.locator("iframe").contentFrame().getByRole("heading", { name: "E2E Seeded Dashboard" }).waitFor({ state: "visible", timeout: 10000 });
+    const preview = page.getByRole("button", { name: "Open generation E2E seeded dashboard", exact: true }).getByTestId("variant-preview");
+    const thumbnail = preview.locator("iframe, img").first();
+    await thumbnail.waitFor({ state: "attached", timeout: 10000 });
+    if (await thumbnail.evaluate((element) => element.tagName) === "IFRAME") {
+      await preview.locator("iframe").contentFrame().getByRole("heading", { name: "E2E Seeded Dashboard" }).waitFor({ state: "visible", timeout: 10000 });
+    } else {
+      assert.match(await thumbnail.getAttribute("src") || "", /^data:image\/webp;base64,/);
+    }
     await preview.click();
     await page.getByRole("button", { name: "Direct element edit" }).waitFor({ state: "visible", timeout: 10000 });
     await page.getByRole("button", { name: "Direct element edit" }).click();
     await page.getByText("Click an element in the preview to target a localized edit").waitFor({ state: "visible" });
 
-    const iframeBox = await page.locator('iframe[title="Preview"]').boundingBox();
-    assert.ok(iframeBox, "preview iframe is visible");
-    await page.mouse.click(iframeBox.x + 180, iframeBox.y + 140);
+    await page.locator('iframe[title="Preview"]').contentFrame().locator("article").first().click();
     await page.getByText("Selected element").waitFor({ state: "visible", timeout: 10000 });
     await page.getByText("fix contrast here").click();
     assert.equal(await page.getByPlaceholder("select an element first...").count(), 0);

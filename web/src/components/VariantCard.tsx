@@ -87,7 +87,6 @@ export default memo(function VariantCard({ generation }: Props) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
-  const [isVisible, setIsVisible] = useState(false);
   const [contentSize, setContentSize] = useState({
     width: VIEWPORT_WIDTH,
     height: 600,
@@ -103,29 +102,13 @@ export default memo(function VariantCard({ generation }: Props) {
   mobileLayoutRef.current = mobileLayout;
   const [containerWidth, setContainerWidth] = useState(320);
 
-  // Lazy-load: only render iframe when card is near the viewport
+  // ponytail: load all 40 paginated cards; virtualize if startup rendering becomes measurable.
   useEffect(() => {
-    const el = sentinelRef.current;
-    if (!el) return;
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (entry.isIntersecting) {
-          setIsVisible(true);
-          observer.disconnect();
-        }
-      },
-      { rootMargin: "200px" }
-    );
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
-
-  useEffect(() => {
-    if (!isVisible || generation.parsed_html) return;
+    if (generation.parsed_html) return;
     void fetchGeneration(generation.id)
       .then((full) => updateGenerationFields(generation.id, full))
       .catch(() => {});
-  }, [isVisible, generation.id, generation.parsed_html, updateGenerationFields]);
+  }, [generation.id, generation.parsed_html, updateGenerationFields]);
 
   const isStyleSource = styleDropperMode && styleSourceId === generation.id;
   const interactivePreview = requiresInteractivePreview(generation.parsed_html);
@@ -176,7 +159,6 @@ export default memo(function VariantCard({ generation }: Props) {
 
   // Measure actual content size once iframe loads
   useEffect(() => {
-    if (!isVisible) return;
     const iframe = iframeRef.current;
     if (!iframe) return;
 
@@ -194,12 +176,10 @@ export default memo(function VariantCard({ generation }: Props) {
 
     iframe.addEventListener("load", handleLoad);
     return () => iframe.removeEventListener("load", handleLoad);
-  }, [isVisible, generation.parsed_html]);
+  }, [generation.parsed_html]);
 
   // Load persisted thumbnail from DB into memory cache, or capture fresh after iframe loads.
   useEffect(() => {
-    if (!isVisible) return;
-
     // If a persisted thumbnail exists, decode it into the in-memory cache immediately
     if (generation.thumbnail && !textureCache.has(generation.id)) {
       const img = new Image();
@@ -301,7 +281,7 @@ export default memo(function VariantCard({ generation }: Props) {
       if (timer) clearTimeout(timer);
       iframe.removeEventListener("load", handleLoad);
     };
-  }, [isVisible, generation.id, generation.parsed_html, generation.thumbnail, updateGenerationFields]);
+  }, [generation.id, generation.parsed_html, generation.thumbnail, updateGenerationFields]);
 
   // For mobile-first designs, zoom in moderately and center the content band
   const desktopScale = containerWidth / VIEWPORT_WIDTH;
@@ -572,7 +552,7 @@ export default memo(function VariantCard({ generation }: Props) {
             className="h-full w-full object-cover"
             onError={() => setThumbnailFailed(true)}
           />
-        ) : isVisible && generation.parsed_html ? (
+        ) : generation.parsed_html ? (
           <iframe
             ref={iframeRef}
             src={previewSrc}
