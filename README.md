@@ -272,7 +272,7 @@ npm run smoke:quality:ci
 
 The CI workflow runs frontend lint, genome governance, build/test, an isolated Playwright E2E workflow smoke, and a Playwright Chromium browser quality smoke. The E2E smoke starts a fake streaming LLM, an isolated SQLite DB, the API, and the Vite app; it verifies generation SSE events, preview direct-edit selection, board navigation, and DB isolation. The quality smoke starts the built API, seeds a sample generation when the database is empty, captures browser screenshots, and uploads smoke artifacts.
 
-Production builds code-split heavy views and on-demand modals. The current measured main Vite chunk is 484.40 kB minified, with Preview, Board, Compare, Batch Compare, Settings, Analytics, prompt templates, blend studio, style patches, component library, and shader overlay emitted as separate lazy chunks.
+Production builds code-split heavy views and on-demand modals, including Preview, Board, Compare, Batch Compare, Settings, Analytics, prompt templates, blend studio, style patches, component library, and the shader overlay.
 
 ### Browser Quality Smoke
 
