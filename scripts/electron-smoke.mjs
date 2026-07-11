@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -22,6 +23,33 @@ const executablePath = findExecutable();
 const userData = path.resolve(process.env.MOTIF_SMOKE_USER_DATA || fs.mkdtempSync(path.join(os.tmpdir(), "motif-smoke-")));
 const expectedVersion = process.env.MOTIF_EXPECT_VERSION || JSON.parse(fs.readFileSync("package.json", "utf8")).version;
 const markerPath = path.join(userData, "desktop-smoke.marker");
+
+async function smokePortableLaunch() {
+  const child = spawn(executablePath, [`--user-data-dir=${userData}`], {
+    env: { ...process.env, MOTIF_DISABLE_UPDATER: "1" },
+    stdio: "ignore",
+  });
+  try {
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      if (child.exitCode !== null) throw new Error(`Portable Motif exited with code ${child.exitCode}`);
+      const database = path.join(userData, "motif.db");
+      if (fs.existsSync(database) && fs.statSync(database).size > 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error("Portable Motif did not initialize its database");
+  } finally {
+    if (child.pid) spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+  }
+}
+
+if (process.platform === "win32" && /-Portable\.exe$/i.test(executablePath)) {
+  assert.equal(path.basename(executablePath), `Motif-${expectedVersion}-Portable.exe`);
+  await smokePortableLaunch();
+  await smokePortableLaunch();
+  console.log(JSON.stringify({ executablePath, version: expectedVersion, portable: true, persistence: true }, null, 2));
+  process.exit(0);
+}
 
 async function launch() {
   return electron.launch({ executablePath, args: [`--user-data-dir=${userData}`] });
