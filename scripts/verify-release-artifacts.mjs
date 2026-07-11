@@ -27,7 +27,7 @@ function verifyChecksums(platform) {
 function verifyUpdaterMetadata(platform, filename) {
   const directory = path.join(root, platform);
   const metadata = fs.readFileSync(path.join(directory, filename), "utf8");
-  const urls = [...metadata.matchAll(/^\s*url:\s*['"]?([^'"\s]+)['"]?\s*$/gm)].map((match) => match[1]);
+  const urls = [...metadata.matchAll(/^\s*(?:-\s*)?url:\s*['"]?([^'"\s]+)['"]?\s*$/gm)].map((match) => match[1]);
   assert.ok(urls.length, `${filename} has no updater assets`);
   for (const url of urls) {
     assert.ok(fs.existsSync(path.join(directory, url)), `${filename} references missing ${url}`);
