@@ -1,6 +1,10 @@
 import express from "express";
-import cors from "cors";
-import db from "./db.js";
+import db, {
+  createDatabaseExport,
+  deleteGenerationCascade,
+  deleteMotifCascade,
+  stageDatabaseRestore,
+} from "./db.js";
 import {
   expandPrompt,
   streamVariant,
@@ -16,9 +20,25 @@ import {
 import type { Generation, ConversationTurn } from "./generate.js";
 import { listGenomes, reloadGenomes } from "./genomes/index.js";
 import { searchImages, formatImagesForPrompt } from "./images.js";
-import { getProviderConfig, fetchModels, buildFetchOptions } from "./provider.js";
-import { serializeSettingsRows, settingsEntriesFromBody } from "./settings.js";
+import { getProviderConfig, fetchModels, buildFetchOptions, explicitProviderConfig } from "./provider.js";
+import { readSensitiveSetting, serializeSettingsRows, settingsEntriesFromBody } from "./settings.js";
 import { createStoredZip } from "./zip.js";
+import {
+  finishSse,
+  PROVIDER_TIMEOUT_MS,
+  pumpGenerationStream,
+  requestAbortSignal,
+  sseEvent,
+} from "./sse.js";
+import {
+  decodedDataUrlBytes,
+  finiteNumber,
+  integer,
+  optionalString,
+  requiredString,
+  resourceId,
+  validateGenerationInput,
+} from "./validation.js";
 import { buildProductionHandoffProject, type HandoffGeneration } from "./handoff.js";
 import {
   normalizeBlendConfig,
@@ -41,30 +61,95 @@ import {
 
 const app = express();
 const PORT = Number(process.env.MOTIF_PORT || 4389);
+const HOST = process.env.MOTIF_HOST || "127.0.0.1";
+if (!["127.0.0.1", "localhost", "::1"].includes(HOST)) {
+  throw new Error("MOTIF_HOST must be a loopback address");
+}
 const WEB_PORT = Number(process.env.MOTIF_WEB_PORT || 4388);
 
-const ALLOWED_ORIGINS = new Set([
-  "http://localhost:4388",
-  "http://127.0.0.1:4388",
-  "http://[::1]:4388",
-  `http://localhost:${WEB_PORT}`,
-  `http://127.0.0.1:${WEB_PORT}`,
-  `http://[::1]:${WEB_PORT}`,
-]);
+function migrateEncryptedSecrets(): void {
+  const store = globalThis.__MOTIF_SECRET_STORE__;
+  if (!store) return;
+  const rows = db.prepare(
+    "SELECT key, value FROM settings WHERE key = 'apiKey' OR key LIKE 'apiKey:%' OR key IN ('pexelsApiKey', 'unsplashAccessKey')"
+  ).all() as Array<{ key: string; value: string }>;
+  const provider = (db.prepare("SELECT value FROM settings WHERE key = 'provider'").get() as { value?: string } | undefined)?.value || "openrouter";
+  const migrated: string[] = [];
+  for (const row of rows) {
+    if (!row.value) continue;
+    const secretKey = row.key === "apiKey"
+      ? `provider:${provider}:apiKey`
+      : row.key.startsWith("apiKey:")
+        ? `provider:${row.key.slice(7)}:apiKey`
+        : `setting:${row.key}`;
+    if (store.get(secretKey) === undefined) store.set(secretKey, row.value);
+    migrated.push(row.key);
+  }
+  if (migrated.length) db.transaction(() => {
+    const remove = db.prepare("DELETE FROM settings WHERE key = ?");
+    for (const key of migrated) remove.run(key);
+  })();
+}
 
-app.use(cors({
-  origin(origin, callback) {
-    const isElectronFileOrigin = process.env.MOTIF_ELECTRON === "1" &&
-      (origin === "null" || origin === "file://");
-    if (!origin || ALLOWED_ORIGINS.has(origin) || isElectronFileOrigin) {
-      callback(null, true);
-      return;
-    }
-    callback(new Error("Origin not allowed"));
-  },
-}));
+migrateEncryptedSecrets();
+
+function sensitiveSetting(key: string): string {
+  return readSensitiveSetting(key, (settingKey) => {
+    const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(settingKey) as { value: string } | undefined;
+    return row?.value;
+  });
+}
+
+async function collectProviderStream(
+  response: globalThis.Response,
+  req: express.Request,
+  res: express.Response,
+  variantId: string,
+) {
+  return pumpGenerationStream(response, {
+    signal: requestAbortSignal(req, res),
+    onChunk: (chunk) => sseEvent(res, "variant_chunk", { id: variantId, chunk }),
+  });
+}
+
+const ALLOWED_ORIGIN = process.env.MOTIF_WEB_ORIGIN || `http://localhost:${WEB_PORT}`;
 
 app.use((req, res, next) => {
+  const origin = req.get("Origin");
+  const sameOrigin = process.env.MOTIF_SESSION_TOKEN && req.get("Host")
+    ? `http://${req.get("Host")}`
+    : "";
+  if (origin && origin !== ALLOWED_ORIGIN && origin !== sameOrigin) {
+    res.status(403).json({ error: "Origin not allowed" });
+    return;
+  }
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Motif-Session");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+  }
+  if (req.method === "OPTIONS") {
+    res.sendStatus(204);
+    return;
+  }
+  next();
+});
+
+app.use("/api", (req, res, next) => {
+  const token = process.env.MOTIF_SESSION_TOKEN;
+  if (token && req.get("X-Motif-Session") !== token) {
+    res.status(401).json({ error: "Invalid session" });
+    return;
+  }
+  next();
+});
+
+app.use((req, res, next) => {
+  if (req.path === "/api/database/restore" && req.is("application/octet-stream")) {
+    express.raw({ type: "application/octet-stream", limit: "512mb" })(req, res, next);
+    return;
+  }
   const limit = req.path === "/api/generate-from-image" ||
     req.path === "/api/style-patches/extract" ||
     req.path === "/api/design-systems/ingest"
@@ -72,6 +157,43 @@ app.use((req, res, next) => {
     : "2mb";
   express.json({ limit })(req, res, next);
 });
+
+app.use((req, res, next) => {
+  if (req.method !== "POST") return next();
+  try {
+    const body = req.body && typeof req.body === "object"
+      ? req.body as Record<string, unknown>
+      : {};
+    if (["/api/generate", "/api/compare", "/api/compare-batch"].includes(req.path)) {
+      Object.assign(body, validateGenerationInput(body));
+    } else if (req.path === "/api/generate-from-image") {
+      body.prompt = optionalString(body.prompt, "prompt", 20_000) || "";
+    } else {
+      if (body.temperature !== undefined) body.temperature = finiteNumber(body.temperature, "temperature", 0, 2);
+      if (body.batchSize !== undefined) body.batchSize = integer(body.batchSize, "batchSize", 1, 8);
+      if (body.model !== undefined) optionalString(body.model, "model");
+    }
+    if (body.provider !== undefined) optionalString(body.provider, "provider", 32);
+    for (const key of ["generationId", "contentGenerationId", "styleGenerationId", "motifId", "stylePatchId"]) {
+      if (body[key]) resourceId(body[key], key);
+    }
+    if (body.image) decodedDataUrlBytes(body.image);
+    next();
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message });
+  }
+});
+
+for (const parameter of ["id", "motifId", "decisionId"]) {
+  app.param(parameter, (req, res, next, value) => {
+    try {
+      resourceId(value, parameter);
+      next();
+    } catch (error) {
+      res.status(400).json({ error: (error as Error).message });
+    }
+  });
+}
 
 // --- Settings ---
 
@@ -93,6 +215,10 @@ app.put("/api/settings", (req, res) => {
     }
   });
   const body = req.body as Record<string, unknown>;
+  if (body.provider !== undefined && !["openrouter", "ollama", "lmstudio", "custom"].includes(String(body.provider))) {
+    res.status(400).json({ error: "provider is invalid" });
+    return;
+  }
   updateMany(settingsEntriesFromBody(body));
   res.json({ ok: true });
 });
@@ -108,21 +234,13 @@ async function handleModels(
   res: express.Response
 ) {
   try {
-    // Start from DB config, then allow body/query overrides so the frontend
-    // can fetch models for a provider before saving settings.
-    const config = getProviderConfig(db);
-    if (overrides.provider) {
-      config.provider = overrides.provider;
-      // Reset base URL to provider default when switching
-      const defaults: Record<string, string> = {
-        openrouter: "https://openrouter.ai/api/v1",
-        ollama: "http://localhost:11434/v1",
-        lmstudio: "http://localhost:1234/v1",
-      };
-      if (defaults[config.provider]) config.baseUrl = defaults[config.provider];
-    }
-    if (overrides.baseUrl) config.baseUrl = overrides.baseUrl;
-    if (overrides.apiKey) config.apiKey = overrides.apiKey;
+    const config = overrides.provider
+      ? explicitProviderConfig({
+          provider: overrides.provider,
+          baseUrl: overrides.baseUrl,
+          apiKey: overrides.apiKey,
+        })
+      : getProviderConfig(db);
 
     const data = await fetchModels(config);
     res.json(data);
@@ -133,10 +251,7 @@ async function handleModels(
 }
 
 app.get("/api/models", async (req, res) => {
-  await handleModels({
-    provider: req.query.provider as import("./provider.js").ProviderType | undefined,
-    baseUrl: req.query.baseUrl as string | undefined,
-  }, res);
+  await handleModels({}, res);
 });
 
 app.post("/api/models", async (req, res) => {
@@ -145,6 +260,18 @@ app.post("/api/models", async (req, res) => {
     baseUrl?: string;
     apiKey?: string;
   };
+  if (!body.provider) {
+    res.status(400).json({ error: "provider is required for a credential probe" });
+    return;
+  }
+  if (!["openrouter", "ollama", "lmstudio", "custom"].includes(body.provider)) {
+    res.status(400).json({ error: "provider is invalid" });
+    return;
+  }
+  if (body.provider === "custom" && !body.baseUrl) {
+    res.status(400).json({ error: "baseUrl is required for custom provider probes" });
+    return;
+  }
   await handleModels(body, res);
 });
 
@@ -480,7 +607,7 @@ app.post("/api/style-patches/extract", async (req, res) => {
       if (!["http:", "https:"].includes(parsedUrl.protocol)) {
         throw new Error("only http and https URLs are supported");
       }
-      const response = await fetch(url);
+      const response = await fetch(url, { signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS) });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       sourceHtml = (await response.text()).slice(0, 250000);
       sourceType = "url";
@@ -617,7 +744,7 @@ app.post("/api/design-systems/ingest", async (req, res) => {
       if (!["http:", "https:"].includes(parsedUrl.protocol)) {
         throw new Error("only http and https URLs are supported");
       }
-      const response = await fetch(url);
+      const response = await fetch(url, { signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS) });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       sourceHtml = (await response.text()).slice(0, 250000);
       htmlTraits = extractStaticStyleTraits(sourceHtml);
@@ -1241,8 +1368,7 @@ app.patch("/api/motifs/:id", (req, res) => {
 
 app.delete("/api/motifs/:id", (req, res) => {
   const { id } = req.params;
-  db.prepare("DELETE FROM generations WHERE motif_id = ?").run(id);
-  db.prepare("DELETE FROM motifs WHERE id = ?").run(id);
+  deleteMotifCascade(id);
   res.json({ ok: true });
 });
 
@@ -1250,13 +1376,44 @@ app.delete("/api/motifs/:id", (req, res) => {
 
 app.get("/api/generations", (req, res) => {
   const motifId = req.query.motif_id as string | undefined;
-  if (motifId) {
-    const rows = db.prepare("SELECT * FROM generations WHERE motif_id = ? ORDER BY created_at DESC").all(motifId);
-    res.json(rows);
-  } else {
-    const rows = db.prepare("SELECT * FROM generations ORDER BY created_at DESC").all();
-    res.json(rows);
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+  const cursor = typeof req.query.cursor === "string" ? req.query.cursor : "";
+  const match = cursor.match(/^(\d+):([A-Za-z0-9._:-]+)$/);
+  if (cursor && !match) {
+    res.status(400).json({ error: "cursor is invalid" });
+    return;
   }
+  const cursorTime = match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+  const cursorId = match?.[2] || "~";
+  const summaryColumns = `
+    id, prompt, genome_id, genome_name, secondary_genome_id, secondary_genome_name,
+    model, favorited, created_at, parent_id, motif_id, thumbnail, recipe_id,
+    variation_distance, board_status, notes, quality_score_json, style_patch_id,
+    pricing_metadata_json
+  `;
+  const rows = (motifId
+    ? db.prepare(`SELECT ${summaryColumns} FROM generations
+        WHERE motif_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+        ORDER BY created_at DESC, id DESC LIMIT ?`).all(motifId, cursorTime, cursorTime, cursorId, limit + 1)
+    : db.prepare(`SELECT ${summaryColumns} FROM generations
+        WHERE created_at < ? OR (created_at = ? AND id < ?)
+        ORDER BY created_at DESC, id DESC LIMIT ?`).all(cursorTime, cursorTime, cursorId, limit + 1)
+  ) as Array<Record<string, unknown>>;
+  const items = rows.slice(0, limit);
+  const last = items.at(-1);
+  res.json({
+    items,
+    nextCursor: rows.length > limit && last ? `${last.created_at}:${last.id}` : null,
+  });
+});
+
+app.get("/api/generations/:id", (req, res) => {
+  const row = db.prepare("SELECT * FROM generations WHERE id = ?").get(req.params.id);
+  if (!row) {
+    res.status(404).json({ error: "Generation not found" });
+    return;
+  }
+  res.json(row);
 });
 
 // Analytics endpoint — genome/model usage stats
@@ -1492,18 +1649,14 @@ app.post("/api/generate", async (req, res) => {
 
   // Search for curated images (once, shared across all variants)
   let curatedImages = "";
-  const pexelsKeyRow = db
-    .prepare("SELECT value FROM settings WHERE key = 'pexelsApiKey'")
-    .get() as { value: string } | undefined;
-  const unsplashKeyRow = db
-    .prepare("SELECT value FROM settings WHERE key = 'unsplashAccessKey'")
-    .get() as { value: string } | undefined;
-  if (pexelsKeyRow?.value || unsplashKeyRow?.value) {
+  const pexelsApiKey = sensitiveSetting("pexelsApiKey");
+  const unsplashAccessKey = sensitiveSetting("unsplashAccessKey");
+  if (pexelsApiKey || unsplashAccessKey) {
     try {
       const images = await searchImages({
         query: prompt,
-        pexelsApiKey: pexelsKeyRow?.value,
-        accessKey: unsplashKeyRow?.value,
+        pexelsApiKey,
+        accessKey: unsplashAccessKey,
         count: 8,
       });
       curatedImages = formatImagesForPrompt(images);
@@ -1622,48 +1775,9 @@ app.post("/api/generate", async (req, res) => {
       });
 
       const streamRes = await fetchPromise;
-      if (!streamRes.ok) {
-        const errText = await streamRes.text();
-        throw new Error(`LLM API error: ${streamRes.status} - ${errText}`);
-      }
-
-      const reader = streamRes.body?.getReader();
-      if (!reader) throw new Error("No stream body");
-
-      const decoder = new TextDecoder();
-      let fullOutput = "";
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const data = line.slice(6).trim();
-          if (data === "[DONE]") continue;
-
-          try {
-            const chunk = JSON.parse(data);
-            const delta = chunk.choices?.[0]?.delta?.content;
-            if (delta) {
-              fullOutput += delta;
-              res.write(
-                `event: variant_chunk\ndata: ${JSON.stringify({
-                  id: variantId,
-                  chunk: delta,
-                })}\n\n`
-              );
-            }
-          } catch {
-            // skip malformed
-          }
-        }
-      }
+      const { output: fullOutput, metadata: pricingMetadata } = await collectProviderStream(
+        streamRes, req, res, variantId
+      );
 
       // Finalize
       const parsedHtml = wrapHTML(extractHTML(fullOutput));
@@ -1713,9 +1827,9 @@ app.post("/api/generate", async (req, res) => {
 
       db.prepare(`
         UPDATE generations
-        SET recipe_id = ?, blend_config_json = ?, variation_distance = ?, board_status = ?, style_patch_id = ?
+        SET recipe_id = ?, blend_config_json = ?, variation_distance = ?, board_status = ?, style_patch_id = ?, pricing_metadata_json = ?
         WHERE id = ?
-      `).run(recipeId, blendConfigJson, resolvedVariationDistance, "candidate", stylePatchId, generation.id);
+      `).run(recipeId, blendConfigJson, resolvedVariationDistance, "candidate", stylePatchId, JSON.stringify(pricingMetadata), generation.id);
 
       // Bump motif updated_at
       if (motifId) {
@@ -1738,8 +1852,7 @@ app.post("/api/generate", async (req, res) => {
   });
 
   await Promise.allSettled(promises);
-  res.write("data: [DONE]\n\n");
-  res.end();
+  finishSse(res);
 });
 
 // --- Favorites ---
@@ -1755,7 +1868,7 @@ app.patch("/api/generations/:id/favorite", (req, res) => {
 });
 
 app.delete("/api/generations/:id", (req, res) => {
-  db.prepare("DELETE FROM generations WHERE id = ?").run(req.params.id);
+  deleteGenerationCascade(req.params.id);
   res.json({ ok: true });
 });
 
@@ -1952,48 +2065,7 @@ app.post("/api/style-drop", async (req, res) => {
     });
 
     const streamRes = await fetchPromise;
-    if (!streamRes.ok) {
-      const errText = await streamRes.text();
-      throw new Error(`LLM API error: ${streamRes.status} - ${errText}`);
-    }
-
-    const reader = streamRes.body?.getReader();
-    if (!reader) throw new Error("No stream body");
-
-    const decoder = new TextDecoder();
-    let fullOutput = "";
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const data = line.slice(6).trim();
-        if (data === "[DONE]") continue;
-
-        try {
-          const chunk = JSON.parse(data);
-          const delta = chunk.choices?.[0]?.delta?.content;
-          if (delta) {
-            fullOutput += delta;
-            res.write(
-              `event: variant_chunk\ndata: ${JSON.stringify({
-                id: variantId,
-                chunk: delta,
-              })}\n\n`
-            );
-          }
-        } catch {
-          // skip malformed
-        }
-      }
-    }
+    const { output: fullOutput, metadata: pricingMetadata } = await collectProviderStream(streamRes, req, res, variantId);
 
     const parsedHtml = wrapHTML(extractHTML(fullOutput));
     const styleDropMotifId = requestedMotifId || (contentGen as Generation & { motif_id?: string }).motif_id || "";
@@ -2037,6 +2109,8 @@ app.post("/api/style-drop", async (req, res) => {
       generation.parent_id,
       generation.motif_id
     );
+    db.prepare("UPDATE generations SET pricing_metadata_json = ? WHERE id = ?")
+      .run(JSON.stringify(pricingMetadata), generation.id);
 
     // Bump motif updated_at
     if (styleDropMotifId) {
@@ -2056,8 +2130,7 @@ app.post("/api/style-drop", async (req, res) => {
     );
   }
 
-  res.write("data: [DONE]\n\n");
-  res.end();
+  finishSse(res);
 });
 
 // --- Edit ---
@@ -2124,48 +2197,7 @@ app.post("/api/edit", async (req, res) => {
     });
 
     const streamRes = await fetchPromise;
-    if (!streamRes.ok) {
-      const errText = await streamRes.text();
-      throw new Error(`LLM API error: ${streamRes.status} - ${errText}`);
-    }
-
-    const reader = streamRes.body?.getReader();
-    if (!reader) throw new Error("No stream body");
-
-    const decoder = new TextDecoder();
-    let fullOutput = "";
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const data = line.slice(6).trim();
-        if (data === "[DONE]") continue;
-
-        try {
-          const chunk = JSON.parse(data);
-          const delta = chunk.choices?.[0]?.delta?.content;
-          if (delta) {
-            fullOutput += delta;
-            res.write(
-              `event: variant_chunk\ndata: ${JSON.stringify({
-                id: variantId,
-                chunk: delta,
-              })}\n\n`
-            );
-          }
-        } catch {
-          // skip malformed
-        }
-      }
-    }
+    const { output: fullOutput, metadata: pricingMetadata } = await collectProviderStream(streamRes, req, res, variantId);
 
     const parsedHtml = wrapHTML(extractHTML(fullOutput));
     const editMotifId = (parentGen as Generation & { motif_id?: string }).motif_id || "";
@@ -2209,6 +2241,8 @@ app.post("/api/edit", async (req, res) => {
       generation.parent_id,
       generation.motif_id
     );
+    db.prepare("UPDATE generations SET pricing_metadata_json = ? WHERE id = ?")
+      .run(JSON.stringify(pricingMetadata), generation.id);
 
     // Bump motif updated_at
     if (editMotifId) {
@@ -2228,8 +2262,7 @@ app.post("/api/edit", async (req, res) => {
     );
   }
 
-  res.write("data: [DONE]\n\n");
-  res.end();
+  finishSse(res);
 });
 
 // --- Reorganize ---
@@ -2294,48 +2327,7 @@ app.post("/api/reorganize", async (req, res) => {
     });
 
     const streamRes = await fetchPromise;
-    if (!streamRes.ok) {
-      const errText = await streamRes.text();
-      throw new Error(`LLM API error: ${streamRes.status} - ${errText}`);
-    }
-
-    const reader = streamRes.body?.getReader();
-    if (!reader) throw new Error("No stream body");
-
-    const decoder = new TextDecoder();
-    let fullOutput = "";
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        const data = line.slice(6).trim();
-        if (data === "[DONE]") continue;
-
-        try {
-          const chunk = JSON.parse(data);
-          const delta = chunk.choices?.[0]?.delta?.content;
-          if (delta) {
-            fullOutput += delta;
-            res.write(
-              `event: variant_chunk\ndata: ${JSON.stringify({
-                id: variantId,
-                chunk: delta,
-              })}\n\n`
-            );
-          }
-        } catch {
-          // skip malformed
-        }
-      }
-    }
+    const { output: fullOutput, metadata: pricingMetadata } = await collectProviderStream(streamRes, req, res, variantId);
 
     const parsedHtml = wrapHTML(extractHTML(fullOutput));
     const reorganizeMotifId = requestedMotifId || (parentGen as Generation & { motif_id?: string }).motif_id || "";
@@ -2379,6 +2371,8 @@ app.post("/api/reorganize", async (req, res) => {
       generation.parent_id,
       generation.motif_id
     );
+    db.prepare("UPDATE generations SET pricing_metadata_json = ? WHERE id = ?")
+      .run(JSON.stringify(pricingMetadata), generation.id);
 
     // Bump motif updated_at
     if (reorganizeMotifId) {
@@ -2398,8 +2392,7 @@ app.post("/api/reorganize", async (req, res) => {
     );
   }
 
-  res.write("data: [DONE]\n\n");
-  res.end();
+  finishSse(res);
 });
 
 // --- Vary ---
@@ -2550,48 +2543,7 @@ app.post("/api/vary", async (req, res) => {
       });
 
       const streamRes = await fetchPromise;
-      if (!streamRes.ok) {
-        const errText = await streamRes.text();
-        throw new Error(`LLM API error: ${streamRes.status} - ${errText}`);
-      }
-
-      const reader = streamRes.body?.getReader();
-      if (!reader) throw new Error("No stream body");
-
-      const decoder = new TextDecoder();
-      let fullOutput = "";
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const data = line.slice(6).trim();
-          if (data === "[DONE]") continue;
-
-          try {
-            const chunk = JSON.parse(data);
-            const delta = chunk.choices?.[0]?.delta?.content;
-            if (delta) {
-              fullOutput += delta;
-              res.write(
-                `event: variant_chunk\ndata: ${JSON.stringify({
-                  id: variantId,
-                  chunk: delta,
-                })}\n\n`
-              );
-            }
-          } catch {
-            // skip malformed
-          }
-        }
-      }
+      const { output: fullOutput, metadata: pricingMetadata } = await collectProviderStream(streamRes, req, res, variantId);
 
       const parsedHtml = wrapHTML(extractHTML(fullOutput));
       const generation: Generation = {
@@ -2635,9 +2587,9 @@ app.post("/api/vary", async (req, res) => {
 
       db.prepare(`
         UPDATE generations
-        SET variation_distance = ?, board_status = ?, style_patch_id = ?
+        SET variation_distance = ?, board_status = ?, style_patch_id = ?, pricing_metadata_json = ?
         WHERE id = ?
-      `).run(resolvedVariationDistance, "candidate", sourceStylePatch?.id ?? "", generation.id);
+      `).run(resolvedVariationDistance, "candidate", sourceStylePatch?.id ?? "", JSON.stringify(pricingMetadata), generation.id);
 
       if (varyMotifId) {
         db.prepare("UPDATE motifs SET updated_at = ? WHERE id = ?").run(
@@ -2661,8 +2613,7 @@ app.post("/api/vary", async (req, res) => {
   });
 
   await Promise.allSettled(promises);
-  res.write("data: [DONE]\n\n");
-  res.end();
+  finishSse(res);
 });
 
 // --- Compare Mode ---
@@ -2700,18 +2651,14 @@ app.post("/api/compare", async (req, res) => {
 
   // Search for curated images (shared across both variants)
   let curatedImages = "";
-  const pexelsKeyRow = db
-    .prepare("SELECT value FROM settings WHERE key = 'pexelsApiKey'")
-    .get() as { value: string } | undefined;
-  const unsplashKeyRow = db
-    .prepare("SELECT value FROM settings WHERE key = 'unsplashAccessKey'")
-    .get() as { value: string } | undefined;
-  if (pexelsKeyRow?.value || unsplashKeyRow?.value) {
+  const pexelsApiKey = sensitiveSetting("pexelsApiKey");
+  const unsplashAccessKey = sensitiveSetting("unsplashAccessKey");
+  if (pexelsApiKey || unsplashAccessKey) {
     try {
       const images = await searchImages({
         query: prompt,
-        pexelsApiKey: pexelsKeyRow?.value,
-        accessKey: unsplashKeyRow?.value,
+        pexelsApiKey,
+        accessKey: unsplashAccessKey,
         count: 8,
       });
       curatedImages = formatImagesForPrompt(images);
@@ -2758,48 +2705,7 @@ app.post("/api/compare", async (req, res) => {
         });
 
         const streamRes = await fetchPromise;
-        if (!streamRes.ok) {
-          const errText = await streamRes.text();
-          throw new Error(`LLM API error: ${streamRes.status} - ${errText}`);
-        }
-
-        const reader = streamRes.body?.getReader();
-        if (!reader) throw new Error("No stream body");
-
-        const decoder = new TextDecoder();
-        let fullOutput = "";
-        let buffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-
-          for (const line of lines) {
-            if (!line.startsWith("data: ")) continue;
-            const data = line.slice(6).trim();
-            if (data === "[DONE]") continue;
-
-            try {
-              const chunk = JSON.parse(data);
-              const delta = chunk.choices?.[0]?.delta?.content;
-              if (delta) {
-                fullOutput += delta;
-                res.write(
-                  `event: variant_chunk\ndata: ${JSON.stringify({
-                    id: variantId,
-                    chunk: delta,
-                  })}\n\n`
-                );
-              }
-            } catch {
-              // skip malformed
-            }
-          }
-        }
+        const { output: fullOutput, metadata: pricingMetadata } = await collectProviderStream(streamRes, req, res, variantId);
 
         const parsedHtml = wrapHTML(extractHTML(fullOutput));
         // No DB write — send result for client to optionally save
@@ -2821,6 +2727,7 @@ app.post("/api/compare", async (req, res) => {
             parent_id: "",
             motif_id: "",
             compare_role: "raw",
+            pricing_metadata_json: JSON.stringify(pricingMetadata),
           })}\n\n`
         );
       } catch (err) {
@@ -2890,48 +2797,7 @@ app.post("/api/compare", async (req, res) => {
         });
 
         const streamRes = await fetchPromise;
-        if (!streamRes.ok) {
-          const errText = await streamRes.text();
-          throw new Error(`LLM API error: ${streamRes.status} - ${errText}`);
-        }
-
-        const reader = streamRes.body?.getReader();
-        if (!reader) throw new Error("No stream body");
-
-        const decoder = new TextDecoder();
-        let fullOutput = "";
-        let buffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-
-          for (const line of lines) {
-            if (!line.startsWith("data: ")) continue;
-            const data = line.slice(6).trim();
-            if (data === "[DONE]") continue;
-
-            try {
-              const chunk = JSON.parse(data);
-              const delta = chunk.choices?.[0]?.delta?.content;
-              if (delta) {
-                fullOutput += delta;
-                res.write(
-                  `event: variant_chunk\ndata: ${JSON.stringify({
-                    id: variantId,
-                    chunk: delta,
-                  })}\n\n`
-                );
-              }
-            } catch {
-              // skip malformed
-            }
-          }
-        }
+        const { output: fullOutput, metadata: pricingMetadata } = await collectProviderStream(streamRes, req, res, variantId);
 
         const parsedHtml = wrapHTML(extractHTML(fullOutput));
         res.write(
@@ -2952,6 +2818,7 @@ app.post("/api/compare", async (req, res) => {
             parent_id: "",
             motif_id: "",
             compare_role: "genome",
+            pricing_metadata_json: JSON.stringify(pricingMetadata),
           })}\n\n`
         );
       } catch (err) {
@@ -2968,8 +2835,7 @@ app.post("/api/compare", async (req, res) => {
   ];
 
   await Promise.allSettled(promises);
-  res.write("data: [DONE]\n\n");
-  res.end();
+  finishSse(res);
 });
 
 // --- Screenshot-to-UI ---
@@ -3067,8 +2933,7 @@ app.post("/api/generate-from-image", async (req, res) => {
         error: `Failed to analyze screenshot: ${err}`,
       })}\n\n`
     );
-    res.write("data: [DONE]\n\n");
-    res.end();
+    finishSse(res);
     return;
   }
 
@@ -3088,19 +2953,15 @@ app.post("/api/generate-from-image", async (req, res) => {
 
   // Search for curated images
   let curatedImages = "";
-  const pexelsKeyRow = db
-    .prepare("SELECT value FROM settings WHERE key = 'pexelsApiKey'")
-    .get() as { value: string } | undefined;
-  const unsplashKeyRow = db
-    .prepare("SELECT value FROM settings WHERE key = 'unsplashAccessKey'")
-    .get() as { value: string } | undefined;
-  if (pexelsKeyRow?.value || unsplashKeyRow?.value) {
+  const pexelsApiKey = sensitiveSetting("pexelsApiKey");
+  const unsplashAccessKey = sensitiveSetting("unsplashAccessKey");
+  if (pexelsApiKey || unsplashAccessKey) {
     try {
       const searchQuery = userPrompt || effectivePrompt.slice(0, 100);
       const images = await searchImages({
         query: searchQuery,
-        pexelsApiKey: pexelsKeyRow?.value,
-        accessKey: unsplashKeyRow?.value,
+        pexelsApiKey,
+        accessKey: unsplashAccessKey,
         count: 8,
       });
       curatedImages = formatImagesForPrompt(images);
@@ -3159,40 +3020,7 @@ app.post("/api/generate-from-image", async (req, res) => {
       });
 
       const streamRes = await fetchPromise;
-      if (!streamRes.ok) {
-        const errText = await streamRes.text();
-        throw new Error(`LLM API error: ${streamRes.status} - ${errText}`);
-      }
-
-      const reader = streamRes.body?.getReader();
-      if (!reader) throw new Error("No stream body");
-
-      const decoder = new TextDecoder();
-      let fullOutput = "";
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const data = line.slice(6).trim();
-          if (data === "[DONE]") continue;
-          try {
-            const chunk = JSON.parse(data);
-            const delta = chunk.choices?.[0]?.delta?.content;
-            if (delta) {
-              fullOutput += delta;
-              res.write(
-                `event: variant_chunk\ndata: ${JSON.stringify({ id: variantId, chunk: delta })}\n\n`
-              );
-            }
-          } catch { /* skip */ }
-        }
-      }
+      const { output: fullOutput, metadata: pricingMetadata } = await collectProviderStream(streamRes, req, res, variantId);
 
       const parsedHtml = wrapHTML(extractHTML(fullOutput));
       const now = Date.now();
@@ -3202,8 +3030,9 @@ app.post("/api/generate-from-image", async (req, res) => {
         genomeId, genomeName, "", "", resolvedModel,
         fullOutput, parsedHtml, 0, now, "", motifId
       );
-      db.prepare("UPDATE generations SET style_patch_id = ? WHERE id = ?").run(
+      db.prepare("UPDATE generations SET style_patch_id = ?, pricing_metadata_json = ? WHERE id = ?").run(
         stylePatchId,
+        JSON.stringify(pricingMetadata),
         variantId
       );
 
@@ -3225,8 +3054,7 @@ app.post("/api/generate-from-image", async (req, res) => {
   });
 
   await Promise.allSettled(promises);
-  res.write("data: [DONE]\n\n");
-  res.end();
+  finishSse(res);
 });
 
 // --- Batch Genome Compare ---
@@ -3269,18 +3097,14 @@ app.post("/api/compare-batch", async (req, res) => {
 
   // Search for curated images (shared across all variants)
   let curatedImages = "";
-  const pexelsKeyRow = db
-    .prepare("SELECT value FROM settings WHERE key = 'pexelsApiKey'")
-    .get() as { value: string } | undefined;
-  const unsplashKeyRow = db
-    .prepare("SELECT value FROM settings WHERE key = 'unsplashAccessKey'")
-    .get() as { value: string } | undefined;
-  if (pexelsKeyRow?.value || unsplashKeyRow?.value) {
+  const pexelsApiKey = sensitiveSetting("pexelsApiKey");
+  const unsplashAccessKey = sensitiveSetting("unsplashAccessKey");
+  if (pexelsApiKey || unsplashAccessKey) {
     try {
       const images = await searchImages({
         query: prompt,
-        pexelsApiKey: pexelsKeyRow?.value,
-        accessKey: unsplashKeyRow?.value,
+        pexelsApiKey,
+        accessKey: unsplashAccessKey,
         count: 8,
       });
       curatedImages = formatImagesForPrompt(images);
@@ -3341,48 +3165,7 @@ app.post("/api/compare-batch", async (req, res) => {
         });
 
         const streamRes = await fetchPromise;
-        if (!streamRes.ok) {
-          const errText = await streamRes.text();
-          throw new Error(`LLM API error: ${streamRes.status} - ${errText}`);
-        }
-
-        const reader = streamRes.body?.getReader();
-        if (!reader) throw new Error("No stream body");
-
-        const decoder = new TextDecoder();
-        let fullOutput = "";
-        let buffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-
-          for (const line of lines) {
-            if (!line.startsWith("data: ")) continue;
-            const data = line.slice(6).trim();
-            if (data === "[DONE]") continue;
-
-            try {
-              const chunk = JSON.parse(data);
-              const delta = chunk.choices?.[0]?.delta?.content;
-              if (delta) {
-                fullOutput += delta;
-                res.write(
-                  `event: variant_chunk\ndata: ${JSON.stringify({
-                    id: variantId,
-                    chunk: delta,
-                  })}\n\n`
-                );
-              }
-            } catch {
-              // skip malformed
-            }
-          }
-        }
+        const { output: fullOutput, metadata: pricingMetadata } = await collectProviderStream(streamRes, req, res, variantId);
 
         const parsedHtml = wrapHTML(extractHTML(fullOutput));
         res.write(
@@ -3403,6 +3186,7 @@ app.post("/api/compare-batch", async (req, res) => {
             parent_id: "",
             motif_id: "",
             compare_role: genomeId,
+            pricing_metadata_json: JSON.stringify(pricingMetadata),
           })}\n\n`
         );
       } catch (err) {
@@ -3419,8 +3203,7 @@ app.post("/api/compare-batch", async (req, res) => {
   );
 
   await Promise.allSettled(promises);
-  res.write("data: [DONE]\n\n");
-  res.end();
+  finishSse(res);
 });
 
 // Save a compare result to the DB (user-initiated)
@@ -3437,6 +3220,7 @@ app.post("/api/compare/save", (req, res) => {
     output = "",
     parsed_html = "",
     compare_role = "",
+    pricing_metadata_json = "",
     motifId = "",
   } = req.body;
 
@@ -3456,6 +3240,8 @@ app.post("/api/compare/save", (req, res) => {
     secondary_genome_id, secondary_genome_name, model, output, parsed_html,
     0, now, "", motifId, compare_role
   );
+  db.prepare("UPDATE generations SET pricing_metadata_json = ? WHERE id = ?")
+    .run(typeof pricing_metadata_json === "string" ? pricing_metadata_json : "", id);
 
   res.json({
     id,
@@ -3474,6 +3260,7 @@ app.post("/api/compare/save", (req, res) => {
     parent_id: "",
     motif_id: motifId,
     compare_role,
+    pricing_metadata_json,
     thumbnail: "",
   });
 });
@@ -3481,6 +3268,11 @@ app.post("/api/compare/save", (req, res) => {
 // --- Styles ---
 
 app.get("/api/styles", (_req, res) => {
+  res.set({
+    Deprecation: "true",
+    Sunset: "Fri, 01 Jan 2027 00:00:00 GMT",
+    Link: "</api/style-patches>; rel=successor-version",
+  });
   const rows = db
     .prepare("SELECT * FROM styles ORDER BY created_at DESC")
     .all();
@@ -3488,6 +3280,11 @@ app.get("/api/styles", (_req, res) => {
 });
 
 app.post("/api/styles", (req, res) => {
+  res.set({
+    Deprecation: "true",
+    Sunset: "Fri, 01 Jan 2027 00:00:00 GMT",
+    Link: "</api/style-patches>; rel=successor-version",
+  });
   const { id, name, tokens_json } = req.body;
   db.prepare(
     "INSERT INTO styles (id, name, tokens_json, created_at) VALUES (?, ?, ?, ?)"
@@ -3849,6 +3646,76 @@ app.delete("/api/templates/:id", (req, res) => {
   res.json({ ok: true });
 });
 
-app.listen(PORT, () => {
-  console.log(`motif api running on http://localhost:${PORT}`);
+app.get("/api/database/export", (_req, res) => {
+  try {
+    const exportPath = createDatabaseExport();
+    res.download(exportPath, "motif.db");
+  } catch (error) {
+    res.status(500).json({ error: (error as Error).message });
+  }
 });
+
+app.post("/api/database/restore", (req, res) => {
+  try {
+    if (!Buffer.isBuffer(req.body)) throw new Error("Expected application/octet-stream database body");
+    const data = req.body;
+    res.json(stageDatabaseRestore(data));
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message });
+  }
+});
+
+app.get("/interactive/:id", (req, res) => {
+  const expectedToken = process.env.MOTIF_PREVIEW_TOKEN;
+  if (expectedToken && req.query.token !== expectedToken) {
+    res.status(401).send("Interactive preview unavailable");
+    return;
+  }
+  const row = db.prepare("SELECT parsed_html FROM generations WHERE id = ?").get(req.params.id) as
+    | { parsed_html: string }
+    | undefined;
+  if (!row) {
+    res.status(404).send("Generation not found");
+    return;
+  }
+  res.set({
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": [
+      "default-src * data: blob:",
+      "script-src * 'unsafe-inline' 'unsafe-eval' data: blob:",
+      "style-src * 'unsafe-inline'",
+      "img-src * data: blob:",
+      "font-src * data:",
+      "connect-src *",
+      "object-src 'none'",
+      "base-uri 'none'",
+      "form-action 'none'",
+      "frame-ancestors 'self'",
+    ].join("; "),
+  });
+  res.type("html").send(row.parsed_html);
+});
+
+if (process.env.MOTIF_WEB_DIST) {
+  app.use(express.static(process.env.MOTIF_WEB_DIST));
+  app.get("/{*path}", (_req, res) => res.sendFile("index.html", { root: process.env.MOTIF_WEB_DIST }));
+}
+
+declare global {
+  var __MOTIF_SERVER_READY__: Promise<{ port: number; close: () => Promise<void> }> | undefined;
+}
+
+globalThis.__MOTIF_SERVER_READY__ = new Promise((resolve, reject) => {
+  const server = app.listen(PORT, HOST, () => {
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : PORT;
+    console.log(`motif api running on http://${HOST}:${port}`);
+    resolve({
+      port,
+      close: () => new Promise<void>((done, fail) => server.close((error) => error ? fail(error) : done())),
+    });
+  });
+  server.once("error", reject);
+});
+
+export { app };

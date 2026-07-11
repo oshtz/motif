@@ -1,7 +1,8 @@
 import { lazy, Suspense, useState, useRef, useEffect } from "react";
 import { useAppStore } from "../store";
-import { fetchGenerations, fetchMotifs, createMotif, renameMotif, deleteMotif } from "../api";
+import { fetchMotifs, createMotif, renameMotif, deleteMotif } from "../api";
 import GenerationProgress from "./GenerationProgress";
+import ConfirmDialog from "./ConfirmDialog";
 
 const ComponentLibrary = lazy(() => import("./ComponentLibrary"));
 
@@ -13,9 +14,9 @@ export default function TopBar({ desktop = false }: TopBarProps) {
   const {
     setActiveTab, setSelectedId, setShowSettings, setShowAnalytics,
     showFavoritesOnly, setShowFavoritesOnly,
-    activeMotifId, setActiveMotifId, setGenerations, setMotifs,
+    activeMotifId, setActiveMotifId, setMotifs,
     motifs, addMotif, removeMotif, updateMotifName,
-    exitDropperMode, exitEditMode, styleDropperMode, editMode,
+    exitDropperMode, exitEditMode, styleDropperMode, editMode, loadGenerations,
   } = useAppStore();
 
   const [dropdownOpen, setDropdownOpen] = useState(false);
@@ -24,6 +25,7 @@ export default function TopBar({ desktop = false }: TopBarProps) {
   const [newName, setNewName] = useState("");
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const createInputRef = useRef<HTMLInputElement>(null);
   const renameInputRef = useRef<HTMLInputElement>(null);
@@ -55,19 +57,7 @@ export default function TopBar({ desktop = false }: TopBarProps) {
     setActiveMotifId(motifId);
     setActiveTab("gallery");
     setDropdownOpen(false);
-    // Show skeleton placeholders while loading
-    const placeholderIds = useAppStore.getState().addPlaceholders(6, motifId ?? undefined);
-    try {
-      const gens = await fetchGenerations(motifId ?? undefined);
-      // Clear placeholders before setting real data to avoid a flash of both
-      const { removeStreamingVariant } = useAppStore.getState();
-      for (const id of placeholderIds) removeStreamingVariant(id);
-      setGenerations(gens);
-    } catch (err) {
-      console.error("Failed to fetch generations:", err);
-      const { removeStreamingVariant } = useAppStore.getState();
-      for (const id of placeholderIds) removeStreamingVariant(id);
-    }
+    await loadGenerations(motifId ?? undefined);
   };
 
   const handleCreate = async () => {
@@ -207,7 +197,7 @@ export default function TopBar({ desktop = false }: TopBarProps) {
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          handleDelete(motif.id);
+                          setDeleteTarget({ id: motif.id, name: motif.name });
                         }}
                         className="w-6 h-6 flex items-center justify-center rounded text-white/40 hover:text-red-400 hover:bg-red-500/10 transition"
                         title="Delete"
@@ -292,23 +282,6 @@ export default function TopBar({ desktop = false }: TopBarProps) {
             if (styleDropperMode) exitDropperMode();
             if (editMode) exitEditMode();
             setSelectedId(null);
-            setActiveTab("batch-compare");
-          }}
-          className={`hidden sm:block p-2 rounded-lg transition ${
-            activeTab === "batch-compare"
-              ? "bg-cyan-500/15 text-cyan-400"
-              : "hover:bg-white/5 text-white/30 hover:text-white/60"
-          }`}
-          title="Batch Compare: Multiple Genomes"
-          aria-label="Batch compare multiple genomes"
-        >
-          <i className="bi bi-grid-3x3-gap" />
-        </button>
-        <button
-          onClick={() => {
-            if (styleDropperMode) exitDropperMode();
-            if (editMode) exitEditMode();
-            setSelectedId(null);
             setActiveTab("board");
           }}
           className={`p-2 rounded-lg transition ${
@@ -321,30 +294,28 @@ export default function TopBar({ desktop = false }: TopBarProps) {
         >
           <i className="bi bi-kanban" />
         </button>
-        <button
-          onClick={() => setShowComponents(true)}
-          className="hidden sm:block p-2 rounded-lg hover:bg-white/5 text-white/30 hover:text-white/60 transition"
-          title="Component Library"
-          aria-label="Open component library"
-        >
-          <i className="bi bi-collection" />
-        </button>
-        <button
-          onClick={() => setShowAnalytics(true)}
-          className="hidden sm:block p-2 rounded-lg hover:bg-white/5 text-white/30 hover:text-white/60 transition"
-          title="Analytics"
-          aria-label="Open analytics"
-        >
-          <i className="bi bi-bar-chart-line" />
-        </button>
-        <button
-          onClick={() => setShowSettings(true)}
-          className="p-2 rounded-lg hover:bg-white/5 text-white/30 hover:text-white/60 transition"
-          title="Settings"
-          aria-label="Open settings"
-        >
-          <i className="bi bi-gear" />
-        </button>
+        <details className="group/tools relative">
+          <summary className="flex cursor-pointer list-none items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs text-white/35 hover:bg-white/5 hover:text-white/60 [&::-webkit-details-marker]:hidden" aria-label="Open Tools and Advanced menu">
+            <i className="bi bi-tools" />
+            <span className="hidden sm:inline">Tools</span>
+            <i className="bi bi-chevron-down text-[9px] group-open/tools:rotate-180" />
+          </summary>
+          <div className="absolute right-0 top-full z-50 mt-1 w-52 rounded-xl border border-white/10 bg-neutral-900 p-1.5 shadow-xl">
+            <button type="button" onClick={() => { setSelectedId(null); setActiveTab("batch-compare"); }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-white/60 hover:bg-white/5">
+              <i className="bi bi-grid-3x3-gap" /> Batch compare
+            </button>
+            <button type="button" onClick={() => setShowComponents(true)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-white/60 hover:bg-white/5">
+              <i className="bi bi-collection" /> Components
+            </button>
+            <button type="button" onClick={() => setShowAnalytics(true)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-white/60 hover:bg-white/5">
+              <i className="bi bi-bar-chart-line" /> Analytics
+            </button>
+            <div className="my-1 border-t border-white/5" />
+            <button type="button" onClick={() => setShowSettings(true)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-white/60 hover:bg-white/5">
+              <i className="bi bi-gear" /> Settings & Advanced
+            </button>
+          </div>
+        </details>
       </div>
       {showComponents && (
         <Suspense fallback={null}>
@@ -354,6 +325,20 @@ export default function TopBar({ desktop = false }: TopBarProps) {
           />
         </Suspense>
       )}
+      <ConfirmDialog
+        open={Boolean(deleteTarget)}
+        title="Delete motif?"
+        confirmLabel="Delete"
+        danger
+        onClose={() => setDeleteTarget(null)}
+        onConfirm={async () => {
+          if (!deleteTarget) return;
+          await handleDelete(deleteTarget.id);
+          setDeleteTarget(null);
+        }}
+      >
+        This permanently deletes “{deleteTarget?.name}” and its generations.
+      </ConfirmDialog>
     </div>
   );
 }

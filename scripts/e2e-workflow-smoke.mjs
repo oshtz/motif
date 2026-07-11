@@ -233,6 +233,7 @@ async function assertGenerationSse() {
       provider: "custom",
       providerBaseUrl: LLM_URL,
       model: "e2e-model",
+      onboardingComplete: "true",
     }),
   });
 
@@ -259,7 +260,8 @@ async function assertGenerationSse() {
   );
   assert.match(sseText, /E2E Generated Variant/);
 
-  const generations = await jsonFetch(`${API_URL}/api/generations`);
+  const payload = await jsonFetch(`${API_URL}/api/generations`);
+  const generations = payload.items ?? payload;
   assert.ok(generations.some((generation) => generation.prompt === "E2E generated dashboard"));
 }
 
@@ -291,7 +293,8 @@ async function assertFrontendWorkflow() {
     await page.waitForTimeout(2000);
     const bodyText = await page.locator("body").textContent();
     if (!bodyText?.includes("e2e_seed")) {
-      const generations = await jsonFetch(`${API_URL}/api/generations`);
+      const payload = await jsonFetch(`${API_URL}/api/generations`);
+      const generations = payload.items ?? payload;
       throw new Error(JSON.stringify({
         message: "Seeded generation was not visible in the frontend",
         bodyText: bodyText?.slice(0, 1200),
@@ -299,15 +302,20 @@ async function assertFrontendWorkflow() {
       }, null, 2));
     }
 
-    const preview = page.getByTestId("variant-preview").first();
+    const preview = page.getByRole("button", { name: "Open generation E2E seeded dashboard", exact: true }).getByTestId("variant-preview");
+    const thumbnail = preview.locator("iframe, img").first();
+    await thumbnail.waitFor({ state: "attached", timeout: 10000 });
+    if (await thumbnail.evaluate((element) => element.tagName) === "IFRAME") {
+      await preview.locator("iframe").contentFrame().getByRole("heading", { name: "E2E Seeded Dashboard" }).waitFor({ state: "visible", timeout: 10000 });
+    } else {
+      assert.match(await thumbnail.getAttribute("src") || "", /^data:image\/webp;base64,/);
+    }
     await preview.click();
     await page.getByRole("button", { name: "Direct element edit" }).waitFor({ state: "visible", timeout: 10000 });
     await page.getByRole("button", { name: "Direct element edit" }).click();
     await page.getByText("Click an element in the preview to target a localized edit").waitFor({ state: "visible" });
 
-    const iframeBox = await page.locator('iframe[title="Preview"]').boundingBox();
-    assert.ok(iframeBox, "preview iframe is visible");
-    await page.mouse.click(iframeBox.x + 180, iframeBox.y + 140);
+    await page.locator('iframe[title="Preview"]').contentFrame().locator("article").first().click();
     await page.getByText("Selected element").waitFor({ state: "visible", timeout: 10000 });
     await page.getByText("fix contrast here").click();
     assert.equal(await page.getByPlaceholder("select an element first...").count(), 0);

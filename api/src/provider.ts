@@ -1,4 +1,6 @@
 import type Database from "better-sqlite3";
+import { readProviderApiKey } from "./settings.js";
+import { PROVIDER_TIMEOUT_MS } from "./sse.js";
 
 export type ProviderType = "openrouter" | "ollama" | "lmstudio" | "custom";
 
@@ -8,12 +10,24 @@ export interface ProviderConfig {
   apiKey: string;
 }
 
-const PROVIDER_DEFAULTS: Record<ProviderType, string> = {
+export const PROVIDER_DEFAULTS: Record<ProviderType, string> = {
   openrouter: "https://openrouter.ai/api/v1",
   ollama: "http://localhost:11434/v1",
   lmstudio: "http://localhost:1234/v1",
   custom: "",
 };
+
+export function explicitProviderConfig(input: {
+  provider: ProviderType;
+  baseUrl?: string;
+  apiKey?: string;
+}): ProviderConfig {
+  return {
+    provider: input.provider,
+    baseUrl: input.baseUrl || PROVIDER_DEFAULTS[input.provider],
+    apiKey: input.apiKey || "",
+  };
+}
 
 /** Read provider configuration from the settings table. */
 export function getProviderConfig(db: Database.Database): ProviderConfig {
@@ -26,7 +40,7 @@ export function getProviderConfig(db: Database.Database): ProviderConfig {
 
   const provider = (get("provider") || "openrouter") as ProviderType;
   const customBaseUrl = get("providerBaseUrl") || "";
-  const apiKey = get("apiKey") || "";
+  const apiKey = readProviderApiKey(provider, get);
 
   const baseUrl = customBaseUrl || PROVIDER_DEFAULTS[provider] || PROVIDER_DEFAULTS.openrouter;
 
@@ -40,6 +54,7 @@ export function getProviderConfig(db: Database.Database): ProviderConfig {
 export function buildFetchOptions(
   config: ProviderConfig,
   body: Record<string, unknown>,
+  signal?: AbortSignal,
 ): { url: string; init: RequestInit } {
   const url = `${config.baseUrl.replace(/\/+$/, "")}/chat/completions`;
 
@@ -63,6 +78,7 @@ export function buildFetchOptions(
       method: "POST",
       headers,
       body: JSON.stringify(body),
+      signal: signal ?? AbortSignal.timeout(120_000),
     },
   };
 }
@@ -73,12 +89,14 @@ export function buildFetchOptions(
  */
 export async function fetchModels(
   config: ProviderConfig,
+  signal: AbortSignal = AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
 ): Promise<{ data: { id: string; name: string }[] }> {
   if (config.provider === "ollama") {
     // Ollama exposes models at /api/tags (not the /v1 path)
     const ollamaBase = config.baseUrl.replace(/\/v1\/?$/, "");
     const res = await fetch(`${ollamaBase}/api/tags`, {
       headers: config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {},
+      signal,
     });
     if (!res.ok) throw new Error(`Ollama model list failed: ${res.status}`);
     const json = (await res.json()) as { models?: { name: string }[] };
@@ -97,7 +115,7 @@ export async function fetchModels(
     headers["X-Title"] = "motif";
   }
 
-  const res = await fetch(url, { headers });
+  const res = await fetch(url, { headers, signal });
   if (!res.ok) throw new Error(`Model list failed: ${res.status}`);
   const data = await res.json();
   return data as { data: { id: string; name: string }[] };

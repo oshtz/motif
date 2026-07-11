@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo, type ReactNode } from "react";
 import { useAppStore, useSettingsStore, type OpenRouterModel } from "../store";
+import { downloadDatabaseBackup, restoreDatabaseBackup } from "../api";
 
 /* ── Reusable Toggle ── */
 function Toggle({
@@ -265,11 +266,33 @@ export default function SettingsModal() {
   const settings = useSettingsStore();
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showStyleDropper, setShowStyleDropper] = useState(false);
+  const [backupStatus, setBackupStatus] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const restoreInputRef = useRef<HTMLInputElement>(null);
+  const firstRun = !settings.onboardingComplete;
   const shouldLoadModels =
     showSettings && settings.availableModels.length === 0 && !settings.modelsLoading;
   const loadModels = settings.loadModels;
+  const beginDraft = settings.beginDraft;
+
+  const close = async () => {
+    settings.discardDraft();
+    await settings.completeOnboarding().catch(() => {});
+    setShowSettings(false);
+  };
 
   // Load models when settings open
+  useEffect(() => {
+    if (showSettings) beginDraft();
+  }, [showSettings, beginDraft]);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!showSettings || !dialog) return;
+    dialog.showModal();
+    return () => dialog.close();
+  }, [showSettings]);
+
   useEffect(() => {
     if (shouldLoadModels) {
       loadModels();
@@ -277,24 +300,33 @@ export default function SettingsModal() {
   }, [shouldLoadModels, loadModels]);
 
   const handleSave = async () => {
-    await settings.saveSettings();
-    setShowSettings(false);
+    try {
+      settings.setField("onboardingComplete", true);
+      await settings.saveSettings();
+      setShowSettings(false);
+    } catch {
+      // Store exposes the response error and the draft remains editable.
+    }
   };
 
   if (!showSettings) return null;
 
   return (
-    <div
-      className="fixed inset-0 z-[100] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
-      onClick={() => setShowSettings(false)}
+    <dialog
+      ref={dialogRef}
+      aria-modal="true"
+      aria-labelledby="settings-title"
+      className="m-auto max-h-[90dvh] w-[calc(100%-2rem)] max-w-lg overflow-hidden rounded-2xl border border-white/10 bg-[#141414] p-0 text-white shadow-2xl backdrop:bg-black/60 backdrop:backdrop-blur-sm"
+      onCancel={(event) => { event.preventDefault(); void close(); }}
+      onClick={(event) => { if (event.target === event.currentTarget) void close(); }}
     >
       <div
-        className="bg-[#141414] border border-white/10 rounded-2xl w-full max-w-lg p-6 space-y-5 max-h-[90vh] overflow-auto"
+        className="max-h-[90dvh] w-full space-y-5 overflow-auto p-6"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-2">
           <i className="bi bi-gear text-lg text-white/50" />
-          <h2 className="text-xl font-semibold">Settings</h2>
+          <h2 id="settings-title" className="text-xl font-semibold">Settings</h2>
         </div>
 
         <div className="space-y-4">
@@ -307,6 +339,8 @@ export default function SettingsModal() {
               value={settings.provider}
               onChange={(v) => {
                 settings.setField("provider", v);
+                settings.setField("apiKey", "");
+                settings.setField("apiKeyRemoveRequested", false);
                 settings.setField("availableModels", []);
                 // Reload models for the new provider immediately
                 setTimeout(() => settings.loadModels(), 0);
@@ -330,16 +364,22 @@ export default function SettingsModal() {
               <input
                 type="password"
                 value={settings.apiKey}
-                onChange={(e) => settings.setField("apiKey", e.target.value)}
+                onChange={(e) => { settings.setField("apiKey", e.target.value); settings.setField("apiKeyRemoveRequested", false); }}
                 placeholder={
-                  settings.apiKeyConfigured
-                    ? `Configured (${settings.apiKeyPreview}) - leave blank to keep`
+                  (settings.providerApiKeyConfigured[settings.provider] ?? settings.apiKeyConfigured)
+                    ? `Configured (${settings.providerApiKeyPreview[settings.provider] || settings.apiKeyPreview}) - leave blank to keep`
                     : settings.provider === "openrouter"
                       ? "sk-or-..."
                       : "API key (if required)"
                 }
                 className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-white/30"
               />
+              {settings.providerApiKeyConfigured[settings.provider] && (
+                <button type="button" onClick={() => { settings.setField("apiKey", ""); settings.setField("apiKeyRemoveRequested", true); }} className="mt-1 text-xs text-red-300/70 hover:text-red-300">
+                  Remove saved key
+                </button>
+              )}
+              {settings.apiKeyRemoveRequested && <p className="mt-1 text-xs text-amber-300/70">Saved key will be removed on Save.</p>}
             </div>
           )}
 
@@ -383,7 +423,7 @@ export default function SettingsModal() {
             <input
               type="password"
               value={settings.pexelsApiKey}
-              onChange={(e) => settings.setField("pexelsApiKey", e.target.value)}
+              onChange={(e) => { settings.setField("pexelsApiKey", e.target.value); settings.setField("clearPexelsApiKey", false); }}
               placeholder={
                 settings.pexelsApiKeyConfigured
                   ? `Configured (${settings.pexelsApiKeyPreview}) - leave blank to keep`
@@ -391,6 +431,9 @@ export default function SettingsModal() {
               }
               className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-white/30"
             />
+            {settings.pexelsApiKeyConfigured && (
+              <button type="button" onClick={() => { settings.setField("pexelsApiKey", ""); settings.setField("clearPexelsApiKey", true); }} className="mt-1 text-xs text-red-300/70 hover:text-red-300">Remove saved key</button>
+            )}
             <p className="text-xs text-white/25 mt-1">
               Free image search — generations use real, curated photos instead of guessed URLs
             </p>
@@ -405,7 +448,7 @@ export default function SettingsModal() {
             <input
               type="password"
               value={settings.unsplashAccessKey}
-              onChange={(e) => settings.setField("unsplashAccessKey", e.target.value)}
+              onChange={(e) => { settings.setField("unsplashAccessKey", e.target.value); settings.setField("clearUnsplashAccessKey", false); }}
               placeholder={
                 settings.unsplashAccessKeyConfigured
                   ? `Configured (${settings.unsplashAccessKeyPreview}) - leave blank to keep`
@@ -413,6 +456,9 @@ export default function SettingsModal() {
               }
               className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-white/30"
             />
+            {settings.unsplashAccessKeyConfigured && (
+              <button type="button" onClick={() => { settings.setField("unsplashAccessKey", ""); settings.setField("clearUnsplashAccessKey", true); }} className="mt-1 text-xs text-red-300/70 hover:text-red-300">Remove saved key</button>
+            )}
             <p className="text-xs text-white/25 mt-1">
               Used as fallback if Pexels key is not set or returns no results
             </p>
@@ -597,9 +643,40 @@ export default function SettingsModal() {
           </div>
         </div>
 
+        <section className="rounded-xl border border-white/10 bg-white/[0.03] p-3" aria-labelledby="data-recovery-title">
+          <h3 id="data-recovery-title" className="text-sm font-medium text-white/70">Data recovery</h3>
+          <p className="mt-1 text-xs text-white/35">Export a consistent SQLite backup, or validate and stage one for restore on the next restart.</p>
+          <input
+            ref={restoreInputRef}
+            type="file"
+            accept=".db,application/vnd.sqlite3,application/octet-stream"
+            className="hidden"
+            onChange={async (event) => {
+              const file = event.target.files?.[0];
+              event.target.value = "";
+              if (!file || !window.confirm("Restore this Motif backup on the next restart? The current database will be kept as a recovery copy.")) return;
+              try {
+                await restoreDatabaseBackup(file);
+                setBackupStatus("Backup validated. Restart Motif to complete the restore.");
+              } catch (error) {
+                setBackupStatus(error instanceof Error ? error.message : "Restore failed");
+              }
+            }}
+          />
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button type="button" onClick={() => void downloadDatabaseBackup().then(() => setBackupStatus("Backup exported.")).catch((error) => setBackupStatus(error instanceof Error ? error.message : "Export failed"))} className="rounded-lg bg-white/10 px-3 py-2 text-xs text-white/70 hover:bg-white/15">
+              Export backup
+            </button>
+            <button type="button" onClick={() => restoreInputRef.current?.click()} className="rounded-lg border border-white/10 px-3 py-2 text-xs text-white/55 hover:text-white/75">
+              Restore backup
+            </button>
+          </div>
+          {backupStatus && <p role="status" className="mt-2 text-xs text-white/45">{backupStatus}</p>}
+        </section>
+
         <div className="flex gap-3 justify-end">
           <button
-            onClick={() => setShowSettings(false)}
+            onClick={() => void close()}
             className="px-4 py-2 rounded-lg text-sm text-white/50 hover:bg-white/5 transition"
           >
             Cancel
@@ -612,7 +689,21 @@ export default function SettingsModal() {
             Save
           </button>
         </div>
+
+        {firstRun && (
+          <section className="rounded-xl border border-sky-500/20 bg-sky-500/[0.07] p-3" aria-labelledby="first-run-title">
+            <h3 id="first-run-title" className="text-sm font-medium text-sky-100">Connect a provider</h3>
+            <p className="mt-1 text-xs leading-relaxed text-white/45">Motif sends prompts and generated UI context to the provider you choose. Keys stay in Motif’s local settings.</p>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <button type="button" onClick={() => void settings.loadModels()} disabled={settings.modelsLoading} className="rounded-lg bg-sky-300 px-3 py-2 text-xs font-medium text-black disabled:opacity-50">
+                {settings.modelsLoading ? "Testing..." : "Test connection"}
+              </button>
+              <span className="text-[11px] text-white/35">Sample: “A calm project dashboard with three active tasks.”</span>
+            </div>
+          </section>
+        )}
+        {settings.error && <p role="alert" className="text-xs text-red-300">{settings.error}</p>}
       </div>
-    </div>
+    </dialog>
   );
 }

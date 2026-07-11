@@ -111,6 +111,7 @@ export default function ChatSidebar() {
     addStreamingVariant, addPlaceholders, expandingVariant,
     replacePlaceholder, removeStreamingVariant,
     appendChunk, finalizeVariant, errorVariant,
+    registerRun,
     editMode, editTargetId, exitEditMode, enterEditMode,
     activeMotifId, motifs,
   } = useAppStore();
@@ -119,6 +120,7 @@ export default function ChatSidebar() {
   const [genomeOpen, setGenomeOpen] = useState(false);
   const [width, setWidth] = useState(DEFAULT_WIDTH);
   const [isDragging, setIsDragging] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => window.innerWidth < 768);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const genomeRef = useRef<HTMLDivElement>(null);
@@ -237,17 +239,17 @@ export default function ChatSidebar() {
     return [...generations].sort((a, b) => b.created_at - a.created_at)[0];
   }, [generations]);
 
-  const handleGenerate = async () => {
-    if (!prompt.trim()) return;
+  const handleGenerate = async (retryPrompt?: string) => {
+    const currentPrompt = retryPrompt ?? prompt.trim();
+    if (!currentPrompt) return;
     setError(null);
     startGeneration();
-    const currentPrompt = prompt.trim();
-    setPrompt("");
     if (inputRef.current) inputRef.current.style.height = "auto";
 
     if (editMode && editTargetId) {
       const placeholderIds = addPlaceholders(1, activeMotifId || undefined);
       const placeholderQueue = [...placeholderIds];
+      const signal = registerRun(placeholderIds, () => void handleGenerate(currentPrompt));
       try {
         await editStream(
           { generationId: editTargetId, instruction: currentPrompt },
@@ -255,14 +257,16 @@ export default function ChatSidebar() {
             onVariantStart: (id, expandedPrompt) => {
               const ph = placeholderQueue.shift();
               if (ph) replacePlaceholder(ph, id, expandedPrompt);
-              else addStreamingVariant(id, expandedPrompt);
+              else addStreamingVariant(id, expandedPrompt, activeMotifId || undefined);
             },
             onVariantChunk: (id, chunk) => appendChunk(id, chunk),
             onVariantDone: (gen) => finalizeVariant(gen.id, gen),
             onVariantError: (id, err) => errorVariant(id, err),
             onError: (err) => setError(err),
-          }
+          },
+          signal
         );
+        if (useAppStore.getState().prompt === currentPrompt) setPrompt("");
       } catch (err) {
         setError(err instanceof Error ? err.message : "Edit failed");
       } finally {
@@ -275,6 +279,7 @@ export default function ChatSidebar() {
 
     const placeholderIds = addPlaceholders(settings.batchSize, activeMotifId || undefined);
     const placeholderQueue = [...placeholderIds];
+    const signal = registerRun(placeholderIds, () => void handleGenerate(currentPrompt));
     const expandedIds = new Map<string, string>();
 
     try {
@@ -300,15 +305,17 @@ export default function ChatSidebar() {
             } else {
               const ph = placeholderQueue.shift();
               if (ph) replacePlaceholder(ph, id, expandedPrompt, genomeName);
-              else addStreamingVariant(id, expandedPrompt);
+              else addStreamingVariant(id, expandedPrompt, activeMotifId || undefined);
             }
           },
           onVariantChunk: (id, chunk) => appendChunk(id, chunk),
           onVariantDone: (gen) => finalizeVariant(gen.id, gen),
           onVariantError: (id, err) => errorVariant(id, err),
           onError: (err) => setError(err),
-        }
+        },
+        signal
       );
+      if (useAppStore.getState().prompt === currentPrompt) setPrompt("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Generation failed");
     } finally {
@@ -320,7 +327,7 @@ export default function ChatSidebar() {
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      handleGenerate();
+      void handleGenerate();
     }
   };
 
@@ -342,15 +349,33 @@ export default function ChatSidebar() {
     inputRef.current?.focus();
   };
 
+  if (collapsed) {
+    return (
+      <button
+        type="button"
+        onClick={() => setCollapsed(false)}
+        className="absolute left-2 top-2 z-30 flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-[#141414] text-white/60 shadow-xl md:hidden"
+        aria-label="Open motif conversation"
+      >
+        <i className="bi bi-chat-left-text" />
+      </button>
+    );
+  }
+
   return (
     <div
-      className="shrink-0 border-r border-white/[0.06] bg-[#0c0c0c] flex flex-col h-full relative"
+      className="absolute inset-y-0 left-0 z-30 flex h-full max-w-[85vw] shrink-0 flex-col border-r border-white/[0.06] bg-[#0c0c0c] shadow-2xl md:relative md:z-auto md:shadow-none"
       style={{ width }}
     >
       {/* Header */}
       {activeMotif && (
         <div className="px-4 pt-5 pb-2.5 border-b border-white/[0.04]">
-          <h2 className="text-white/80 text-sm font-medium truncate">{activeMotif.name}</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="min-w-0 flex-1 truncate text-sm font-medium text-white/80">{activeMotif.name}</h2>
+            <button type="button" onClick={() => setCollapsed(true)} className="flex h-9 w-9 items-center justify-center rounded-lg text-white/40 hover:bg-white/5 md:hidden" aria-label="Collapse motif conversation">
+              <i className="bi bi-chevron-left" />
+            </button>
+          </div>
           <p className="text-white/20 text-[10px] mt-0.5">
             {generations.length} generation{generations.length !== 1 ? "s" : ""}
           </p>
@@ -620,7 +645,7 @@ export default function ChatSidebar() {
             className="flex-1 bg-transparent text-white/90 text-[13px] placeholder:text-white/20 focus:outline-none resize-none leading-relaxed"
           />
           <button
-            onClick={handleGenerate}
+            onClick={() => void handleGenerate()}
             disabled={!prompt.trim()}
             className={`shrink-0 w-7 h-7 flex items-center justify-center rounded-lg text-xs disabled:opacity-20 disabled:cursor-not-allowed transition ${
               editMode

@@ -24,6 +24,11 @@ export default function MasonryGrid() {
   const generations = useAppStore((s) => s.generations);
   const showFavoritesOnly = useAppStore((s) => s.showFavoritesOnly);
   const activeGenerations = useAppStore((s) => s.activeGenerations);
+  const nextCursor = useAppStore((s) => s.generationNextCursor);
+  const loading = useAppStore((s) => s.generationsLoading);
+  const loadError = useAppStore((s) => s.generationsError);
+  const activeMotifId = useAppStore((s) => s.activeMotifId);
+  const loadGenerations = useAppStore((s) => s.loadGenerations);
   const containerRef = useRef<HTMLDivElement>(null);
   const [colCount, setColCount] = useState(3);
 
@@ -75,38 +80,40 @@ export default function MasonryGrid() {
     return cols;
   }, [allItems, colCount]);
 
-  if (allItems.length === 0 && activeGenerations === 0) {
+  if (allItems.length === 0 && activeGenerations === 0 && !loading) {
     return (
       <div className="flex-1 flex items-center justify-center h-full text-white/20 text-lg">
         <div className="text-center space-y-3">
           <i className={`bi ${showFavoritesOnly ? "bi-star" : "bi-grid-3x3-gap"} text-5xl`} />
-          <p>{showFavoritesOnly ? "No favorited generations yet" : "Enter a prompt to generate motifs"}</p>
+          <p>{loadError || (showFavoritesOnly ? "No favorited generations yet" : "Enter a prompt to generate motifs")}</p>
+          {loadError && <button type="button" onClick={() => void loadGenerations(activeMotifId ?? undefined)} className="rounded-lg bg-white/10 px-3 py-2 text-sm text-white/60">Retry</button>}
         </div>
       </div>
     );
   }
 
   return (
-    <div
-      ref={containerRef}
-      className="w-full p-4 pt-8 flex items-start"
-      style={{ gap: COL_GAP }}
-    >
-      {columns.map((col, colIdx) => (
-        <div
-          key={colIdx}
-          className="flex-1 min-w-0 flex flex-col"
-          style={{ gap: COL_GAP }}
-        >
-          {col.map((item) =>
-            item.type === "streaming" ? (
-              <StreamingCard key={item.id} variantId={item.id} />
-            ) : (
-              <VariantCard key={item.id} generation={item.data} />
-            )
-          )}
+    <div className="w-full pb-8">
+      <div
+        ref={containerRef}
+        className="w-full p-4 pt-8 flex items-start"
+        style={{ gap: COL_GAP }}
+      >
+        {columns.map((col, colIdx) => (
+          <div key={colIdx} className="flex-1 min-w-0 flex flex-col" style={{ gap: COL_GAP }}>
+            {col.map((item) => item.type === "streaming"
+              ? <StreamingCard key={item.id} variantId={item.id} />
+              : <VariantCard key={item.id} generation={item.data} />)}
+          </div>
+        ))}
+      </div>
+      {(nextCursor || loading) && (
+        <div className="flex justify-center px-4">
+          <button type="button" disabled={loading} onClick={() => void loadGenerations(activeMotifId ?? undefined, true)} className="rounded-lg border border-white/10 px-4 py-2 text-sm text-white/50 disabled:opacity-50">
+            {loading ? "Loading..." : "Load more"}
+          </button>
         </div>
-      ))}
+      )}
     </div>
   );
 }

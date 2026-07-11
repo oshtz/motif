@@ -163,14 +163,14 @@ export default function BatchCompareView() {
   // Determine grid columns based on panel count
   const colClass =
     panels.length <= 2
-      ? "grid-cols-2"
+      ? "grid-cols-1 sm:grid-cols-2"
       : panels.length <= 3
         ? "grid-cols-3"
         : panels.length <= 4
-          ? "grid-cols-2 lg:grid-cols-4"
+          ? "grid-cols-1 sm:grid-cols-2 lg:grid-cols-4"
           : panels.length <= 6
-            ? "grid-cols-2 lg:grid-cols-3"
-            : "grid-cols-2 lg:grid-cols-4";
+            ? "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3"
+            : "grid-cols-1 sm:grid-cols-2 lg:grid-cols-4";
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden">

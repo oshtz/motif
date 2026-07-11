@@ -2,15 +2,60 @@ import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { randomUUID } from "crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const DB_PATH = process.env.MOTIF_DB_PATH || path.join(__dirname, "..", "motif.db");
+const RESTORE_PATH = `${DB_PATH}.restore`;
+const RECOVERY_PATH = `${DB_PATH}.recovery`;
+const LATEST_SCHEMA_VERSION = 2;
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+
+export function validateDatabaseFile(filePath: string): void {
+  const candidate = new Database(filePath, { readonly: true, fileMustExist: true });
+  try {
+    const integrity = candidate.pragma("integrity_check", { simple: true });
+    if (integrity !== "ok") throw new Error(`SQLite integrity check failed: ${String(integrity)}`);
+    const tables = candidate.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('generations', 'settings')"
+    ).all() as Array<{ name: string }>;
+    if (tables.length !== 2) throw new Error("Restore is not a Motif database");
+  } finally {
+    candidate.close();
+  }
+}
+
+if (fs.existsSync(RESTORE_PATH)) {
+  validateDatabaseFile(RESTORE_PATH);
+  if (fs.existsSync(DB_PATH)) fs.copyFileSync(DB_PATH, RECOVERY_PATH);
+  fs.copyFileSync(RESTORE_PATH, DB_PATH);
+  fs.unlinkSync(RESTORE_PATH);
+}
 
 const db = new Database(DB_PATH);
 
 db.pragma("journal_mode = WAL");
+
+function backupDatabase(label: string): string {
+  const backupDir = path.join(path.dirname(DB_PATH), "backups");
+  fs.mkdirSync(backupDir, { recursive: true });
+  const target = path.join(backupDir, `motif-${Date.now()}-${randomUUID()}-${label}.db`);
+  db.exec(`VACUUM INTO '${target.replaceAll("'", "''")}'`);
+  const backups = fs.readdirSync(backupDir)
+    .filter((name) => name.endsWith(".db"))
+    .map((name) => ({ name, time: fs.statSync(path.join(backupDir, name)).mtimeMs }))
+    .sort((a, b) => b.time - a.time);
+  for (const old of backups.slice(3)) fs.unlinkSync(path.join(backupDir, old.name));
+  return target;
+}
+
+const initialVersion = db.pragma("user_version", { simple: true }) as number;
+if (initialVersion < LATEST_SCHEMA_VERSION && fs.existsSync(DB_PATH) && fs.statSync(DB_PATH).size > 0) {
+  backupDatabase(`v${initialVersion}-to-v${LATEST_SCHEMA_VERSION}`);
+}
+
+if (initialVersion < 1) db.transaction(() => {
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS generations (
@@ -284,5 +329,69 @@ db.exec(`
     created_at INTEGER NOT NULL
   );
 `);
+
+db.pragma("user_version = 1");
+})();
+
+if ((db.pragma("user_version", { simple: true }) as number) < 2) db.transaction(() => {
+  try {
+    db.exec(`ALTER TABLE generations ADD COLUMN pricing_metadata_json TEXT NOT NULL DEFAULT ''`);
+  } catch {
+    // Existing development databases may already contain the column.
+  }
+  db.pragma("user_version = 2");
+})();
+
+export function createDatabaseExport(): string {
+  return backupDatabase("export");
+}
+
+export function stageDatabaseRestore(data: Buffer): { restartRequired: true; recoveryPath: string } {
+  if (data.length === 0 || data.length > 512 * 1024 * 1024) throw new Error("Invalid database size");
+  const temporary = `${RESTORE_PATH}.${randomUUID()}.tmp`;
+  fs.writeFileSync(temporary, data, { flag: "wx" });
+  try {
+    validateDatabaseFile(temporary);
+    const recoveryPath = backupDatabase("pre-restore");
+    fs.renameSync(temporary, RESTORE_PATH);
+    return { restartRequired: true, recoveryPath };
+  } catch (error) {
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    throw error;
+  }
+}
+
+function deleteGenerationRows(generationId: string) {
+  const systems = db.prepare(
+    "SELECT id, style_patch_id FROM design_systems WHERE source_type = 'generation' AND source_ref = ?"
+  ).all(generationId) as Array<{ id: string; style_patch_id: string }>;
+  for (const system of systems) {
+    db.prepare("DELETE FROM style_patches WHERE id = ? OR (source_type = 'design-system' AND source_ref = ?)")
+      .run(system.style_patch_id, system.id);
+  }
+  db.prepare("DELETE FROM design_systems WHERE source_type = 'generation' AND source_ref = ?").run(generationId);
+  db.prepare("DELETE FROM style_patches WHERE source_type = 'generation' AND source_ref = ?").run(generationId);
+  db.prepare("DELETE FROM board_events WHERE generation_id = ?").run(generationId);
+  db.prepare("DELETE FROM board_style_decisions WHERE source_generation_id = ?").run(generationId);
+  db.prepare("DELETE FROM handoff_exports WHERE generation_id = ?").run(generationId);
+  db.prepare("DELETE FROM generations WHERE id = ?").run(generationId);
+}
+
+export const deleteGenerationCascade = db.transaction(deleteGenerationRows);
+
+export const deleteMotifCascade = db.transaction((motifId: string) => {
+  const generations = db.prepare("SELECT id FROM generations WHERE motif_id = ?").all(motifId) as Array<{ id: string }>;
+  for (const generation of generations) deleteGenerationRows(generation.id);
+  const systems = db.prepare("SELECT id, style_patch_id FROM design_systems WHERE motif_id = ?").all(motifId) as Array<{ id: string; style_patch_id: string }>;
+  for (const system of systems) {
+    db.prepare("DELETE FROM style_patches WHERE id = ? OR (source_type = 'design-system' AND source_ref = ?)")
+      .run(system.style_patch_id, system.id);
+  }
+  db.prepare("DELETE FROM design_systems WHERE motif_id = ?").run(motifId);
+  db.prepare("DELETE FROM board_events WHERE motif_id = ?").run(motifId);
+  db.prepare("DELETE FROM board_style_decisions WHERE motif_id = ?").run(motifId);
+  db.prepare("DELETE FROM generations WHERE motif_id = ?").run(motifId);
+  db.prepare("DELETE FROM motifs WHERE id = ?").run(motifId);
+});
 
 export default db;

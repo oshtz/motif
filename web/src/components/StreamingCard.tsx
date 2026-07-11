@@ -22,6 +22,9 @@ export default memo(function StreamingCard({ variantId }: Props) {
     (s) => s.streamingVariants.find((v) => v.id === variantId)!
   );
   const promoteVariant = useAppStore((s) => s.promoteVariant);
+  const cancelVariant = useAppStore((s) => s.cancelVariant);
+  const retryVariant = useAppStore((s) => s.retryVariant);
+  const removeStreamingVariant = useAppStore((s) => s.removeStreamingVariant);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [shellReady, setShellReady] = useState(false);
@@ -99,10 +102,20 @@ export default memo(function StreamingCard({ variantId }: Props) {
           Generation failed
         </div>
         {variant.error && (
-          <p className="text-xs text-red-400/60 mt-1 truncate">
+          <p className="text-xs text-red-400/60 mt-1" role="alert">
             {variant.error}
           </p>
         )}
+        <div className="mt-3 flex gap-2">
+          {variant.retry && (
+            <button type="button" onClick={() => retryVariant(variant.id)} className="rounded-md bg-white/10 px-2.5 py-1.5 text-xs text-white/70">
+              Retry
+            </button>
+          )}
+          <button type="button" onClick={() => removeStreamingVariant(variant.id)} className="rounded-md px-2.5 py-1.5 text-xs text-white/40">
+            Dismiss
+          </button>
+        </div>
       </div>
     );
   }
@@ -115,6 +128,14 @@ export default memo(function StreamingCard({ variantId }: Props) {
         className="bg-[#0a0a0a] overflow-hidden relative transition-[height] duration-150"
         style={{ height: hasContent ? displayHeight : 300 }}
       >
+        <button
+          type="button"
+          onClick={() => cancelVariant(variant.id)}
+          className="absolute right-2 top-2 z-20 rounded-md bg-black/60 px-2 py-1 text-xs text-white/60 hover:text-white"
+          aria-label="Cancel generation"
+        >
+          Cancel
+        </button>
         {hasContent && (
           <iframe
             ref={iframeRef}

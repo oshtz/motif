@@ -2,6 +2,10 @@ export {};
 
 declare global {
   interface Window {
+    motifDesktop?: {
+      getSessionToken: () => string;
+      getPreviewToken: () => string;
+    };
     motifWindow?: {
       minimize: () => Promise<void>;
       toggleMaximize: () => Promise<boolean>;

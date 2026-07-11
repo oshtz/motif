@@ -2,22 +2,56 @@ import type { Generation, Motif } from "./store";
 import { measureRuntimeQuality, type RuntimeQualityAudit } from "./quality-runtime";
 
 function apiUrl(path: string): string {
-  if (!path.startsWith("/api")) return path;
-  const apiBaseUrl = new URLSearchParams(window.location.search).get("motifApiBaseUrl");
-  return apiBaseUrl ? `${apiBaseUrl}${path}` : path;
+  return path;
 }
 
-export function apiFetch(input: string, init?: RequestInit): Promise<Response> {
-  return fetch(apiUrl(input), init);
+async function responseError(response: Response): Promise<Error> {
+  let message = `${response.status} ${response.statusText}`.trim();
+  try {
+    const body = await response.clone().json() as { error?: unknown; message?: unknown };
+    const detail = body.error ?? body.message;
+    if (typeof detail === "string" && detail.trim()) message = detail;
+  } catch {
+    // Non-JSON failures keep the HTTP status text.
+  }
+  return new Error(message || "Request failed");
 }
 
-export async function fetchGenerations(motifId?: string): Promise<Generation[]> {
-  const url = motifId ? `/api/generations?motif_id=${encodeURIComponent(motifId)}` : "/api/generations";
-  const res = await apiFetch(url);
-  const rows = await res.json();
-  return rows.map((r: Record<string, unknown>) => ({
-    ...r,
-    expanded_prompt: r.expanded_prompt ?? "",
+export async function apiFetch(input: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  const sessionToken = window.motifDesktop?.getSessionToken();
+  if (sessionToken) headers.set("X-Motif-Session", sessionToken);
+  const response = await fetch(apiUrl(input), { ...init, headers });
+  if (!response.ok) throw await responseError(response);
+  return response;
+}
+
+export async function apiJson<T>(input: string, init?: RequestInit): Promise<T> {
+  return (await apiFetch(input, init)).json() as Promise<T>;
+}
+
+export async function downloadDatabaseBackup(): Promise<void> {
+  const response = await apiFetch("/api/database/export");
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `motif-backup-${new Date().toISOString().slice(0, 10)}.db`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+export async function restoreDatabaseBackup(file: File): Promise<{ restartRequired: true }> {
+  return apiJson("/api/database/restore", {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: await file.arrayBuffer(),
+  });
+}
+
+function normalizeGeneration(r: Record<string, unknown>): Generation {
+  return {
+    ...(r as unknown as Generation),
+    expanded_prompt: (r.expanded_prompt as string) ?? "",
     favorited: Boolean(r.favorited),
     parent_id: (r.parent_id as string) ?? "",
     motif_id: (r.motif_id as string) ?? "",
@@ -28,7 +62,39 @@ export async function fetchGenerations(motifId?: string): Promise<Generation[]> 
     notes: (r.notes as string) ?? "",
     quality_score_json: (r.quality_score_json as string) ?? "",
     style_patch_id: (r.style_patch_id as string) ?? "",
-  }));
+    thumbnail: (r.thumbnail as string) ?? "",
+  };
+}
+
+export async function fetchGenerations(motifId?: string): Promise<Generation[]> {
+  return (await fetchGenerationPage(motifId)).items;
+}
+
+export interface GenerationPage {
+  items: Generation[];
+  nextCursor: string | null;
+}
+
+export async function fetchGenerationPage(
+  motifId?: string,
+  cursor?: string,
+  limit = 40
+): Promise<GenerationPage> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (motifId) params.set("motif_id", motifId);
+  if (cursor) params.set("cursor", cursor);
+  const payload = await apiJson<Record<string, unknown>[] | { items: Record<string, unknown>[]; nextCursor?: string | null }>(
+    `/api/generations?${params}`
+  );
+  const rows = Array.isArray(payload) ? payload : payload.items;
+  return {
+    items: rows.map(normalizeGeneration),
+    nextCursor: Array.isArray(payload) ? null : payload.nextCursor ?? null,
+  };
+}
+
+export async function fetchGeneration(id: string): Promise<Generation> {
+  return normalizeGeneration(await apiJson<Record<string, unknown>>(`/api/generations/${encodeURIComponent(id)}`));
 }
 
 // --- Motifs ---
@@ -188,7 +254,7 @@ export async function saveThumbnail(id: string, thumbnail: string): Promise<void
 }
 
 /** Shared SSE stream reader used by both generate and style-drop endpoints */
-interface SSECallbacks {
+export interface SSECallbacks {
   onVariantExpanding?: (id: string, index: number, compareRole?: string) => void;
   onVariantStart: (id: string, expandedPrompt: string, genomeName?: string, compareRole?: string) => void;
   onVariantChunk: (id: string, chunk: string) => void;
@@ -204,57 +270,83 @@ async function readSSEStream(res: Response, callbacks: SSECallbacks): Promise<vo
   const decoder = new TextDecoder();
   let buffer = "";
   let currentEvent = "message";
+  let completed = false;
+  const unfinished = new Set<string>();
+
+  const handleLine = (rawLine: string) => {
+    const line = rawLine.replace(/\r$/, "");
+    if (line.startsWith("event:")) {
+      currentEvent = line.slice(6).trim() || "message";
+      return;
+    }
+    if (!line.startsWith("data:")) return;
+    const data = line.slice(5).trim();
+    if (data === "[DONE]") {
+      completed = true;
+      return;
+    }
+
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(data) as Record<string, unknown>;
+    } catch {
+      currentEvent = "message";
+      return;
+    }
+
+    const event = currentEvent;
+    currentEvent = "message";
+    switch (event) {
+      case "variant_expanding":
+        callbacks.onVariantExpanding?.(String(parsed.id ?? ""), Number(parsed.index ?? 0), typeof parsed.compareRole === "string" ? parsed.compareRole : undefined);
+        break;
+      case "variant_start":
+        unfinished.add(String(parsed.id ?? ""));
+        callbacks.onVariantStart(String(parsed.id ?? ""), String(parsed.expandedPrompt ?? ""), typeof parsed.genomeName === "string" ? parsed.genomeName : undefined, typeof parsed.compareRole === "string" ? parsed.compareRole : undefined);
+        break;
+      case "variant_chunk":
+        callbacks.onVariantChunk(String(parsed.id ?? ""), String(parsed.chunk ?? ""));
+        break;
+      case "variant_done":
+        unfinished.delete(String(parsed.id ?? ""));
+        callbacks.onVariantDone(normalizeGeneration(parsed));
+        break;
+      case "variant_error":
+        unfinished.delete(String(parsed.id ?? ""));
+        callbacks.onVariantError(String(parsed.id ?? ""), String(parsed.error ?? "Generation failed"));
+        break;
+      case "error": {
+        const message = typeof parsed.error === "string" ? parsed.error : "Generation failed";
+        callbacks.onError?.(message);
+        throw new Error(message);
+      }
+    }
+  };
 
   while (true) {
     const { done, value } = await reader.read();
-    if (done) break;
+    if (done) {
+      buffer += decoder.decode();
+      if (buffer) buffer.split("\n").forEach(handleLine);
+      break;
+    }
 
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split("\n");
     buffer = lines.pop() || "";
 
     for (const line of lines) {
-      if (line.startsWith("event: ")) {
-        currentEvent = line.slice(7).trim();
-        continue;
-      }
-      if (!line.startsWith("data: ")) continue;
-
-      const data = line.slice(6).trim();
-      if (data === "[DONE]") return;
-
-      try {
-        const parsed = JSON.parse(data);
-
-        switch (currentEvent) {
-          case "variant_expanding":
-            callbacks.onVariantExpanding?.(parsed.id, parsed.index, parsed.compareRole);
-            break;
-          case "variant_start":
-            callbacks.onVariantStart(parsed.id, parsed.expandedPrompt, parsed.genomeName, parsed.compareRole);
-            break;
-          case "variant_chunk":
-            callbacks.onVariantChunk(parsed.id, parsed.chunk);
-            break;
-          case "variant_done":
-            callbacks.onVariantDone({
-              ...parsed,
-              expanded_prompt: parsed.expanded_prompt ?? "",
-              favorited: Boolean(parsed.favorited),
-              board_status: parsed.board_status ?? "candidate",
-              style_patch_id: parsed.style_patch_id ?? "",
-            });
-            break;
-          case "variant_error":
-            callbacks.onVariantError(parsed.id, parsed.error);
-            break;
-        }
-      } catch {
-        // skip
-      }
-
-      currentEvent = "message";
+      handleLine(line);
+      if (completed) break;
     }
+    if (completed) break;
+  }
+
+  if (!completed) {
+    const message = "Generation stream ended before completion";
+    unfinished.forEach((id) => callbacks.onVariantError(id, message));
+    callbacks.onError?.(message);
+    throw new Error(message);
   }
 }
 
@@ -273,12 +365,14 @@ export async function generateStream(
     batchSize?: number;
     motifId?: string;
   },
-  callbacks: SSECallbacks
+  callbacks: SSECallbacks,
+  signal?: AbortSignal
 ): Promise<void> {
   const res = await apiFetch("/api/generate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(options),
+    signal,
   });
 
   if (!res.ok) {
@@ -300,12 +394,14 @@ export async function screenshotToUIStream(
     stylePatchId?: string;
     motifId?: string;
   },
-  callbacks: SSECallbacks
+  callbacks: SSECallbacks,
+  signal?: AbortSignal
 ): Promise<void> {
   const res = await apiFetch("/api/generate-from-image", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(options),
+    signal,
   });
 
   if (!res.ok) {
@@ -322,12 +418,14 @@ export async function styleDropStream(
     styleGenerationId: string;
     motifId?: string;
   },
-  callbacks: SSECallbacks
+  callbacks: SSECallbacks,
+  signal?: AbortSignal
 ): Promise<void> {
   const res = await apiFetch("/api/style-drop", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(options),
+    signal,
   });
 
   if (!res.ok) {
@@ -346,12 +444,14 @@ export async function varyStream(
     variationDistance?: string;
     motifId?: string;
   },
-  callbacks: SSECallbacks
+  callbacks: SSECallbacks,
+  signal?: AbortSignal
 ): Promise<void> {
   const res = await apiFetch("/api/vary", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(options),
+    signal,
   });
 
   if (!res.ok) {
@@ -377,12 +477,14 @@ export async function editStream(
       outerHTML?: string;
     };
   },
-  callbacks: SSECallbacks
+  callbacks: SSECallbacks,
+  signal?: AbortSignal
 ): Promise<void> {
   const res = await apiFetch("/api/edit", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(options),
+    signal,
   });
 
   if (!res.ok) {
@@ -398,12 +500,14 @@ export async function reorganizeStream(
     generationId: string;
     motifId?: string;
   },
-  callbacks: SSECallbacks
+  callbacks: SSECallbacks,
+  signal?: AbortSignal
 ): Promise<void> {
   const res = await apiFetch("/api/reorganize", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(options),
+    signal,
   });
 
   if (!res.ok) {

@@ -33,6 +33,7 @@ export default function PromptBar() {
     appendChunk,
     finalizeVariant,
     errorVariant,
+    registerRun,
     editMode,
     editTargetId,
     exitEditMode,
@@ -59,6 +60,20 @@ export default function PromptBar() {
   const loadGenomes = settings.loadGenomes;
 
   const isGenerating = activeGenerations > 0;
+  const runEstimate = useMemo(() => {
+    const pricing = settings.availableModels.find((model) => model.id === settings.model)?.pricing;
+    if (!pricing) return null;
+    const inputRate = Number(pricing.prompt);
+    const outputRate = Number(pricing.completion);
+    if (!Number.isFinite(inputRate) || !Number.isFinite(outputRate)) return null;
+    const calls = settings.batchSize;
+    const estimatedInputTokens = 2000 + Math.ceil(prompt.length / 4);
+    const estimatedOutputTokens = 4000;
+    return {
+      calls,
+      cost: calls * (estimatedInputTokens * inputRate + estimatedOutputTokens * outputRate),
+    };
+  }, [prompt.length, settings.availableModels, settings.batchSize, settings.model]);
   const genomeSummary = useMemo(
     () =>
       buildActiveGenomeSummary({
@@ -110,17 +125,18 @@ export default function PromptBar() {
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  const handleGenerate = async () => {
-    if (!prompt.trim() && !uploadedImage) return;
+  const handleGenerate = async (retryPrompt?: string, retryImage?: string | null) => {
+    const currentPrompt = retryPrompt ?? prompt.trim();
+    const currentImage = retryImage === undefined ? uploadedImage : retryImage;
+    if (!currentPrompt && !currentImage) return;
     setError(null);
     startGeneration();
-    const currentPrompt = prompt.trim();
-    setPrompt("");
 
     if (editMode && editTargetId) {
       // Edit mode: single variant edit
       const placeholderIds = addPlaceholders(1, activeMotifId || undefined);
       const placeholderQueue = [...placeholderIds];
+      const signal = registerRun(placeholderIds, () => void handleGenerate(currentPrompt, currentImage));
 
       try {
         await editStream(
@@ -134,15 +150,17 @@ export default function PromptBar() {
               if (placeholderId) {
                 replacePlaceholder(placeholderId, id, expandedPrompt);
               } else {
-                addStreamingVariant(id, expandedPrompt);
+                addStreamingVariant(id, expandedPrompt, activeMotifId || undefined);
               }
             },
             onVariantChunk: (id, chunk) => appendChunk(id, chunk),
             onVariantDone: (gen) => finalizeVariant(gen.id, gen),
             onVariantError: (id, err) => errorVariant(id, err),
             onError: (err) => setError(err),
-          }
+          },
+          signal
         );
+        if (useAppStore.getState().prompt === currentPrompt) setPrompt("");
       } catch (err) {
         setError(err instanceof Error ? err.message : "Edit failed");
       } finally {
@@ -156,7 +174,7 @@ export default function PromptBar() {
     }
 
     // Screenshot-to-UI mode
-    if (uploadedImage) {
+    if (currentImage) {
       let motifId = activeMotifId;
       if (!motifId) {
         try {
@@ -179,12 +197,13 @@ export default function PromptBar() {
 
       const placeholderIds = addPlaceholders(settings.batchSize, motifId || undefined);
       const placeholderQueue = [...placeholderIds];
+      const signal = registerRun(placeholderIds, () => void handleGenerate(currentPrompt, currentImage));
       const expandedIds = new Map<string, string>();
 
       try {
         await screenshotToUIStream(
           {
-            image: uploadedImage,
+            image: currentImage,
             prompt: currentPrompt || undefined,
             genomeId: settings.genomeId || undefined,
             model: settings.model || undefined,
@@ -209,7 +228,7 @@ export default function PromptBar() {
                 if (placeholderId) {
                   replacePlaceholder(placeholderId, id, expandedPrompt, genomeName);
                 } else {
-                  addStreamingVariant(id, expandedPrompt);
+                  addStreamingVariant(id, expandedPrompt, motifId || undefined);
                 }
               }
             },
@@ -217,14 +236,16 @@ export default function PromptBar() {
             onVariantDone: (gen) => finalizeVariant(gen.id, gen),
             onVariantError: (id, err) => errorVariant(id, err),
             onError: (err) => setError(err),
-          }
+          },
+          signal
         );
+        if (useAppStore.getState().prompt === currentPrompt) setPrompt("");
+        setUploadedImage(null);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Screenshot-to-UI failed");
       } finally {
         for (const id of placeholderQueue) removeStreamingVariant(id);
         endGeneration();
-        setUploadedImage(null);
       }
       return;
     }
@@ -253,6 +274,7 @@ export default function PromptBar() {
     // Normal generation mode
     const placeholderIds = addPlaceholders(settings.batchSize, motifId || undefined);
     const placeholderQueue = [...placeholderIds];
+    const signal = registerRun(placeholderIds, () => void handleGenerate(currentPrompt, currentImage));
     // Track which placeholders have been swapped to real IDs during expanding phase
     const expandedIds = new Map<string, string>(); // realId → current store ID
 
@@ -290,7 +312,7 @@ export default function PromptBar() {
               if (placeholderId) {
                 replacePlaceholder(placeholderId, id, expandedPrompt, genomeName);
               } else {
-                addStreamingVariant(id, expandedPrompt);
+                addStreamingVariant(id, expandedPrompt, motifId || undefined);
               }
             }
           },
@@ -298,8 +320,10 @@ export default function PromptBar() {
           onVariantDone: (gen) => finalizeVariant(gen.id, gen),
           onVariantError: (id, err) => errorVariant(id, err),
           onError: (err) => setError(err),
-        }
+        },
+        signal
       );
+      if (useAppStore.getState().prompt === currentPrompt) setPrompt("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Generation failed");
     } finally {
@@ -461,7 +485,7 @@ export default function PromptBar() {
             type="text"
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handleGenerate()}
+            onKeyDown={(e) => { if (e.key === "Enter") void handleGenerate(); }}
             placeholder={editMode ? "describe your edit... e.g. make the header blue" : uploadedImage ? "optional guidance for the screenshot..." : "describe a UI..."}
             className={`order-3 min-w-0 flex-1 bg-white/5 border rounded-xl px-4 py-2.5 text-white text-sm placeholder:text-white/30 focus:outline-none transition ${
               editMode ? "border-cyan-500/20 focus:border-cyan-500/40" : "border-white/[0.06] focus:border-white/20"
@@ -622,8 +646,16 @@ export default function PromptBar() {
               {settings.batchSize}x
             </button>
           )}
+          {!editMode && runEstimate && (
+            <span
+              className="order-1 shrink-0 text-[10px] text-white/30"
+              title="Rough estimate using about 2k input and 4k output tokens per call"
+            >
+              {runEstimate.calls} calls · ~${runEstimate.cost < 0.01 ? runEstimate.cost.toFixed(4) : runEstimate.cost.toFixed(2)}
+            </span>
+          )}
           <button
-            onClick={handleGenerate}
+            onClick={() => void handleGenerate()}
             disabled={!prompt.trim() && !uploadedImage}
             className={`order-3 font-medium px-5 py-2.5 rounded-xl text-sm disabled:opacity-40 disabled:cursor-not-allowed transition flex items-center justify-center gap-2 shrink-0 max-sm:flex-1 ${
               editMode

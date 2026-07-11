@@ -153,7 +153,7 @@ function BoardCard({
   const appendChunk = useAppStore((s) => s.appendChunk);
   const finalizeVariant = useAppStore((s) => s.finalizeVariant);
   const errorVariant = useAppStore((s) => s.errorVariant);
-  const addGeneration = useAppStore((s) => s.addGeneration);
+  const registerRun = useAppStore((s) => s.registerRun);
   const activeMotifId = useAppStore((s) => s.activeMotifId);
   const [notes, setNotes] = useState(generation.notes || "");
   const [busy, setBusy] = useState<string | null>(null);
@@ -207,6 +207,7 @@ function BoardCard({
     const placeholderIds = addPlaceholders(batchSize, activeMotifId || undefined);
     const placeholderQueue = [...placeholderIds];
     const expandedIds = new Set<string>();
+    const signal = registerRun(placeholderIds, () => void followUp(distance));
 
     try {
       await varyStream(
@@ -236,13 +237,10 @@ function BoardCard({
             }
           },
           onVariantChunk: (id, chunk) => appendChunk(id, chunk),
-          onVariantDone: (gen) => {
-            finalizeVariant(gen.id, gen);
-            addGeneration(gen);
-            removeStreamingVariant(gen.id);
-          },
+          onVariantDone: (gen) => finalizeVariant(gen.id, gen),
           onVariantError: (id, err) => errorVariant(id, err),
-        }
+        },
+        signal
       );
     } catch (err) {
       console.error("Board follow-up failed:", err);
@@ -668,7 +666,7 @@ export default function BoardView() {
   const appendChunk = useAppStore((s) => s.appendChunk);
   const finalizeVariant = useAppStore((s) => s.finalizeVariant);
   const errorVariant = useAppStore((s) => s.errorVariant);
-  const addGeneration = useAppStore((s) => s.addGeneration);
+  const registerRun = useAppStore((s) => s.registerRun);
   const updateMotifFields = useAppStore((s) => s.updateMotifFields);
   const activeMotif = motifs.find((m) => m.id === activeMotifId);
   const [filter, setFilter] = useState<BoardFilter>("all");
@@ -1023,6 +1021,7 @@ export default function BoardView() {
         const placeholderIds = addPlaceholders(1, activeMotifId || undefined);
         const placeholderQueue = [...placeholderIds];
         const expandedIds = new Set<string>();
+        const signal = registerRun(placeholderIds, () => void bulkFollowAccepted(distance));
 
         try {
           await varyStream(
@@ -1052,13 +1051,10 @@ export default function BoardView() {
                 }
               },
               onVariantChunk: (id, chunk) => appendChunk(id, chunk),
-              onVariantDone: (gen) => {
-                finalizeVariant(gen.id, gen);
-                addGeneration(gen);
-                removeStreamingVariant(gen.id);
-              },
+              onVariantDone: (gen) => finalizeVariant(gen.id, gen),
               onVariantError: (id, err) => errorVariant(id, err),
-            }
+            },
+            signal
           );
         } catch (err) {
           console.error("Bulk accepted follow-up failed:", err);
@@ -1067,6 +1063,7 @@ export default function BoardView() {
             removeStreamingVariant(id);
           }
         }
+        if (signal.aborted) break;
       }
     } finally {
       endGeneration();

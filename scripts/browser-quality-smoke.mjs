@@ -100,12 +100,14 @@ async function seedGeneration() {
 async function chooseGeneration() {
   const requestedId = argValue("--generation");
   if (requestedId) {
-    const generations = await getJson(`${API_URL}/api/generations`);
+    const payload = await getJson(`${API_URL}/api/generations`);
+    const generations = payload.items ?? payload;
     const found = generations.find((item) => item.id === requestedId);
     if (!found) throw new Error(`Generation ${requestedId} not found at ${API_URL}`);
     return found;
   }
-  const generations = await getJson(`${API_URL}/api/generations`);
+  const payload = await getJson(`${API_URL}/api/generations`);
+  const generations = payload.items ?? payload;
   if (!Array.isArray(generations) || generations.length === 0) {
     if (hasFlag("--seed-if-empty")) return seedGeneration();
     throw new Error(`No generations found at ${API_URL}`);

@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect } from "react";
 import { useAppStore, useSettingsStore } from "./store";
-import { fetchGenerations, fetchMotifs } from "./api";
+import { fetchMotifs } from "./api";
 import DesktopTitleBar from "./components/DesktopTitleBar";
 import TopBar from "./components/TopBar";
 import PromptBar from "./components/PromptBar";
@@ -14,7 +14,7 @@ const CompareView = lazy(() => import("./components/CompareView"));
 const BatchCompareView = lazy(() => import("./components/BatchCompareView"));
 const BoardView = lazy(() => import("./components/BoardView"));
 const ShaderOverlay = lazy(() => import("./components/ShaderOverlay"));
-const isDesktopRuntime = new URLSearchParams(window.location.search).get("motifDesktop") === "1";
+const isDesktopRuntime = Boolean(window.motifDesktop);
 
 function ViewFallback() {
   return (
@@ -38,28 +38,23 @@ export default function App() {
     dropperHoveredTexture,
     showSettings,
     showAnalytics,
+    loadGenerations,
+    generationsLoading,
+    generationsError,
   } = useAppStore();
-  const { loaded, loadSettings, loadGenomes } = useSettingsStore();
+  const { loaded, onboardingComplete, loadSettings, loadGenomes } = useSettingsStore();
   const keepGalleryMounted = activeTab === "gallery" || activeTab === "preview";
 
   useEffect(() => {
     loadSettings();
     loadGenomes();
-    // Show skeleton placeholders while loading initial generations
-    const placeholderIds = useAppStore.getState().addPlaceholders(6);
-    fetchGenerations()
-      .then((gens) => {
-        const { removeStreamingVariant } = useAppStore.getState();
-        for (const id of placeholderIds) removeStreamingVariant(id);
-        setGenerations(gens);
-      })
-      .catch((err) => {
-        console.error(err);
-        const { removeStreamingVariant } = useAppStore.getState();
-        for (const id of placeholderIds) removeStreamingVariant(id);
-      });
+    void loadGenerations();
     fetchMotifs().then(setMotifs).catch(console.error);
-  }, [loadSettings, loadGenomes, setGenerations, setMotifs]);
+  }, [loadSettings, loadGenomes, loadGenerations, setGenerations, setMotifs]);
+
+  useEffect(() => {
+    if (loaded && !onboardingComplete) useAppStore.getState().setShowSettings(true);
+  }, [loaded, onboardingComplete]);
 
   // Escape key exits dropper mode or edit mode
   useEffect(() => {
@@ -90,9 +85,12 @@ export default function App() {
   }
 
   return (
-    <div className={`h-screen flex flex-col ${isDesktopRuntime ? "pt-20" : "pt-12"}`}>
+    <div className={`h-dvh flex flex-col ${isDesktopRuntime ? "pt-20" : "pt-12"}`}>
       {isDesktopRuntime && <DesktopTitleBar />}
       <TopBar desktop={isDesktopRuntime} />
+      <div className="sr-only" role="status" aria-live="polite">
+        {generationsLoading ? "Loading generations" : generationsError || ""}
+      </div>
 
       {/* Style dropper mode banner */}
       {styleDropperMode && (
@@ -110,7 +108,7 @@ export default function App() {
 
       {/* Keep gallery mounted so grid layout is preserved when returning from preview */}
       {keepGalleryMounted && (
-        <div className={activeTab === "gallery" ? "flex-1 flex overflow-hidden" : "hidden"}>
+        <div className={activeTab === "gallery" ? "relative flex-1 flex overflow-hidden" : "hidden"}>
           {/* Chat sidebar inside a motif */}
           {activeMotifId !== null && <ChatSidebar />}
 
