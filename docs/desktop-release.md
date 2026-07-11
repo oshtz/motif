@@ -38,12 +38,7 @@ The installed Windows app uses the normal Electron updater. The portable executa
 
 ## Required secrets
 
-Tagged Windows releases require valid Authenticode credentials:
-
-| Secret | Purpose |
-| --- | --- |
-| `WINDOWS_CODESIGN_CERTIFICATE` | Base64-encoded Windows code-signing certificate |
-| `WINDOWS_CODESIGN_PASSWORD` | Certificate password |
+Windows artifacts are intentionally published without Authenticode signing. SHA-256 manifests and updater metadata are still verified before publication; Windows may show SmartScreen warnings, so the zip remains the lower-friction fallback.
 
 macOS builds require signing and notarization credentials:
 
@@ -56,7 +51,7 @@ macOS builds require signing and notarization credentials:
 | `APPLE_APP_SPECIFIC_PASSWORD` | Apple app-specific password |
 | `APPLE_TEAM_ID` | Apple Developer Team ID |
 
-The workflow verifies Authenticode on every tagged Windows executable and verifies macOS code signatures, Gatekeeper assessment, notarization staples, updater metadata, and final checksums before publication.
+The workflow verifies Windows artifacts, updater metadata, and checksums, plus macOS code signatures, Gatekeeper assessment, notarization staples, updater metadata, and final checksums before publication.
 
 ## Release procedure
 

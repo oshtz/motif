@@ -22,6 +22,7 @@ if (tag) assert.equal(tag, `v${root.version}`, `release tag must be v${root.vers
 
 const workflow = fs.readFileSync(".github/workflows/desktop-release.yml", "utf8");
 assert.match(workflow, /--publish never/);
+assert.doesNotMatch(workflow, /WINDOWS_CODESIGN_/);
 assert.equal((workflow.match(/softprops\/action-gh-release/g) || []).length, 1);
 
 console.log(`Release contract verified for Motif ${root.version}${tag ? ` (${tag})` : ""}.`);
