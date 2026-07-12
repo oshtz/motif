@@ -1,8 +1,9 @@
 import { lazy, Suspense, useState, useRef, useEffect } from "react";
-import { useAppStore } from "../store";
+import { useAppStore, useSettingsStore } from "../store";
 import { fetchMotifs, createMotif, renameMotif, deleteMotif } from "../api";
 import GenerationProgress from "./GenerationProgress";
 import ConfirmDialog from "./ConfirmDialog";
+import ModelPicker from "./ModelPicker";
 
 const ComponentLibrary = lazy(() => import("./ComponentLibrary"));
 
@@ -18,6 +19,7 @@ export default function TopBar({ desktop = false }: TopBarProps) {
     motifs, addMotif, removeMotif, updateMotifName,
     exitDropperMode, exitEditMode, styleDropperMode, editMode, loadGenerations,
   } = useAppStore();
+  const settings = useSettingsStore();
 
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [showComponents, setShowComponents] = useState(false);
@@ -247,6 +249,15 @@ export default function TopBar({ desktop = false }: TopBarProps) {
 
       {/* Right: Generation progress + Compare + Settings */}
       <div className="flex items-center gap-1 sm:gap-3 shrink-0">
+        <ModelPicker
+          variant="compact"
+          value={settings.model}
+          onChange={settings.persistModel}
+          models={settings.availableModels}
+          loading={settings.modelsLoading}
+          onLoadModels={settings.loadModels}
+          error={settings.error}
+        />
         <GenerationProgress />
         <button
           onClick={() => setShowFavoritesOnly(!showFavoritesOnly)}

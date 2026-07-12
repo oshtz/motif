@@ -462,6 +462,7 @@ interface SettingsState {
   ) => void;
   loadSettings: () => Promise<void>;
   saveSettings: () => Promise<void>;
+  persistModel: (model: string) => Promise<void>;
   completeOnboarding: () => Promise<void>;
   beginDraft: () => void;
   discardDraft: () => void;
@@ -470,6 +471,7 @@ interface SettingsState {
 }
 
 let settingsDraft: Partial<SettingsState> | null = null;
+let modelSaveRequest = 0;
 
 export const useSettingsStore = create<SettingsState>((set, get) => ({
   provider: "openrouter",
@@ -586,6 +588,26 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       error: null,
     });
     settingsDraft = null;
+  },
+
+  persistModel: async (model) => {
+    const previous = get().model;
+    const request = ++modelSaveRequest;
+    set({ model, error: null });
+    try {
+      await apiFetch("/api/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model }),
+      });
+    } catch (error) {
+      if (request === modelSaveRequest) {
+        set({
+          model: previous,
+          error: error instanceof Error ? error.message : "Failed to save model",
+        });
+      }
+    }
   },
 
   completeOnboarding: async () => {
