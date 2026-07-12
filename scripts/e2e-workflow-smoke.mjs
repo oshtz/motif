@@ -61,6 +61,15 @@ function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitForCondition(check, label, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await wait(100);
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
 async function readRequestBody(req) {
   let body = "";
   for await (const chunk of req) body += chunk;
@@ -69,6 +78,17 @@ async function readRequestBody(req) {
 
 function startFakeLlm() {
   const server = http.createServer(async (req, res) => {
+    if (req.url?.endsWith("/models")) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        data: [
+          { id: "e2e-model", name: "E2E Primary Model" },
+          { id: "e2e-model-alt", name: "E2E Alternative Model" },
+        ],
+      }));
+      return;
+    }
+
     if (!req.url?.endsWith("/chat/completions")) {
       res.writeHead(404);
       res.end("not found");
@@ -86,6 +106,7 @@ function startFakeLlm() {
         GENERATED_HTML.slice(80, 180),
         GENERATED_HTML.slice(180),
       ]) {
+        await wait(500);
         res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: chunk } }] })}\n\n`);
       }
       res.write("data: [DONE]\n\n");
@@ -265,12 +286,12 @@ async function assertGenerationSse() {
   assert.ok(generations.some((generation) => generation.prompt === "E2E generated dashboard"));
 }
 
-async function seedFrontendGeneration() {
+async function seedFrontendGeneration(prompt = "E2E seeded dashboard", motifId = "") {
   return jsonFetch(`${API_URL}/api/compare/save`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      prompt: "E2E seeded dashboard",
+      prompt,
       expanded_prompt: "Seeded generation for frontend E2E workflow.",
       system_prompt: "[e2e:seed]",
       genome_id: "e2e",
@@ -279,12 +300,26 @@ async function seedFrontendGeneration() {
       output: SEEDED_HTML,
       parsed_html: SEEDED_HTML,
       compare_role: "e2e",
+      motifId,
     }),
   });
 }
 
 async function assertFrontendWorkflow() {
+  const scrollMotif = await jsonFetch(`${API_URL}/api/motifs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "E2E Scroll Motif" }),
+  });
+  for (let index = 0; index < 8; index += 1) {
+    await seedFrontendGeneration(`E2E gallery fixture ${index + 1}`);
+    await wait(2);
+  }
   await seedFrontendGeneration();
+  for (let index = 0; index < 8; index += 1) {
+    await seedFrontendGeneration(`E2E motif fixture ${index + 1}`, scrollMotif.id);
+    await wait(2);
+  }
 
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
@@ -302,6 +337,25 @@ async function assertFrontendWorkflow() {
       }, null, 2));
     }
 
+    const galleryScroller = page.getByTestId("gallery-scroller");
+    await galleryScroller.waitFor({ state: "visible" });
+    assert.equal(await galleryScroller.evaluate((element) => element.scrollTop), 0);
+    assert.match(
+      await page.locator('[role="button"][aria-label^="Open generation"]').first().getAttribute("aria-label") || "",
+      /E2E motif fixture 8/
+    );
+
+    await galleryScroller.evaluate((element) => {
+      element.scrollTop = element.scrollHeight;
+    });
+    assert.ok(await galleryScroller.evaluate((element) => element.scrollTop > 0));
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await galleryScroller.waitFor({ state: "visible" });
+    await page.waitForFunction(() => {
+      const element = document.querySelector('[data-testid="gallery-scroller"]');
+      return element instanceof HTMLElement && element.scrollTop === 0;
+    });
+
     const preview = page.getByRole("button", { name: "Open generation E2E seeded dashboard", exact: true }).getByTestId("variant-preview");
     const thumbnail = preview.locator("iframe, img").first();
     await thumbnail.waitFor({ state: "attached", timeout: 10000 });
@@ -310,6 +364,9 @@ async function assertFrontendWorkflow() {
     } else {
       assert.match(await thumbnail.getAttribute("src") || "", /^data:image\/webp;base64,/);
     }
+    await galleryScroller.evaluate((element) => { element.scrollTop = 120; });
+    const scrollBeforePreview = await galleryScroller.evaluate((element) => element.scrollTop);
+    assert.ok(scrollBeforePreview > 0);
     await preview.click();
     await page.getByRole("button", { name: "Direct element edit" }).waitFor({ state: "visible", timeout: 10000 });
     await page.getByRole("button", { name: "Direct element edit" }).click();
@@ -324,9 +381,102 @@ async function assertFrontendWorkflow() {
     await page.getByRole("button", { name: "Apply", exact: true }).waitFor({ state: "visible" });
     assert.equal(await page.getByRole("button", { name: "Apply", exact: true }).isEnabled(), true);
 
+    await page.getByTitle("Back to Gallery").click();
+    await galleryScroller.waitFor({ state: "visible" });
+    assert.ok(Math.abs(await galleryScroller.evaluate((element) => element.scrollTop) - scrollBeforePreview) <= 2);
+
+    await page.getByTestId("model-picker-trigger").click();
+    const modelSearch = page.getByPlaceholder("Search models...");
+    await modelSearch.fill("Alternative");
+    await page.getByRole("option", { name: /E2E Alternative Model/ }).click();
+    await waitForCondition(async () => {
+      const current = await jsonFetch(`${API_URL}/api/settings`);
+      return current.model === "e2e-model-alt";
+    }, "top-bar model persistence");
+
+    let failNextModelSave = true;
+    const failModelSave = async (route) => {
+      if (failNextModelSave && route.request().method() === "PUT") {
+        failNextModelSave = false;
+        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Forced model save failure" }) });
+        return;
+      }
+      await route.continue();
+    };
+    await page.route("**/api/settings", failModelSave);
+    await page.getByTestId("model-picker-trigger").click();
+    await page.getByPlaceholder("Search models...").fill("Primary");
+    await page.getByRole("option", { name: /E2E Primary Model/ }).click();
+    await page.waitForFunction(() => document.querySelector('[data-testid="model-picker-trigger"]')?.getAttribute("title")?.includes("E2E Alternative Model"));
+    await page.unroute("**/api/settings", failModelSave);
+
+    await page.getByLabel("Select motif").click();
+    await page.getByRole("button", { name: "E2E Scroll Motif", exact: true }).click();
+    await page.getByRole("button", { name: "Open generation E2E motif fixture 8", exact: true }).waitFor({ state: "visible" });
+    await galleryScroller.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+    assert.ok(await galleryScroller.evaluate((element) => element.scrollTop > 160));
+
+    const generatedPrompt = "E2E top bar model generation";
+    await page.getByPlaceholder("describe a UI...").fill(generatedPrompt);
+    await page.getByPlaceholder("describe a UI...").press("Enter");
+    await page.waitForFunction(() => {
+      const element = document.querySelector('[data-testid="gallery-scroller"]');
+      return element instanceof HTMLElement && element.scrollTop <= 2;
+    });
+    await page.waitForTimeout(700);
+    await galleryScroller.evaluate((element) => { element.scrollTop = 160; });
+    await waitForCondition(async () => {
+      const payload = await jsonFetch(`${API_URL}/api/generations`);
+      const generations = payload.items ?? payload;
+      return generations.some((generation) => generation.prompt === generatedPrompt && generation.model === "e2e-model-alt");
+    }, "generation using selected top-bar model", 15000);
+    const scrollAfterFinalization = await galleryScroller.evaluate((element) => element.scrollTop);
+    assert.ok(Math.abs(scrollAfterFinalization - 160) <= 2, `gallery moved to ${scrollAfterFinalization} after finalization`);
+
+    await page.getByLabel("Open Tools and Advanced menu").click();
+    const settingsMenuButton = page.getByRole("button", { name: "Settings & Advanced" });
+    await settingsMenuButton.click();
+    const settingsDialog = page.locator('dialog[aria-labelledby="settings-title"]');
+    await settingsDialog.waitFor({ state: "visible" });
+    const settingsBox = await settingsDialog.boundingBox();
+    assert.ok(settingsBox && settingsBox.width > 800);
+    const settingsNavigation = settingsDialog.locator('nav[aria-label="Settings categories"]');
+
+    for (const section of ["Providers", "Image Sources", "Advanced", "Data", "Generation"]) {
+      await settingsNavigation.locator("button", { hasText: section }).click();
+      await settingsDialog.getByRole("heading", { name: section, exact: true }).waitFor({ state: "visible" });
+    }
+
+    const temperature = settingsDialog.locator('input[type="number"]').first();
+    const originalTemperature = await temperature.inputValue();
+    await temperature.fill("1.2");
+    await settingsDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await settingsDialog.waitFor({ state: "hidden" });
+
+    await settingsMenuButton.click();
+    await settingsDialog.waitFor({ state: "visible" });
+    assert.equal(await settingsDialog.locator('input[type="number"]').first().inputValue(), originalTemperature);
+    await settingsDialog.locator('input[type="number"]').first().fill("1.1");
+    await settingsDialog.locator("footer button", { hasText: "Save" }).click();
+    await waitForCondition(async () => {
+      const current = await jsonFetch(`${API_URL}/api/settings`);
+      return current.temperature === "1.1";
+    }, "settings save");
+
+    await page.setViewportSize({ width: 650, height: 850 });
+    if (!await settingsMenuButton.isVisible()) {
+      await page.getByLabel("Open Tools and Advanced menu").click();
+    }
+    await settingsMenuButton.click();
+    await settingsNavigation.locator("button", { hasText: "Data" }).click();
+    await settingsDialog.getByRole("heading", { name: "Data", exact: true }).waitFor({ state: "visible" });
+    await page.keyboard.press("Escape");
+    await settingsDialog.waitFor({ state: "hidden" });
+    await page.setViewportSize({ width: 1280, height: 900 });
+
     await page.getByRole("button", { name: "Open project board" }).click();
     await page.getByRole("heading", { name: "Candidate", exact: true }).waitFor({ state: "visible", timeout: 10000 });
-    await page.locator("article", { hasText: "E2E seeded dashboard" }).first().waitFor({ state: "visible", timeout: 10000 });
+    await page.locator("article", { hasText: "E2E motif fixture 8" }).first().waitFor({ state: "visible", timeout: 10000 });
   } finally {
     await browser.close();
   }
@@ -340,6 +490,7 @@ async function main() {
     MOTIF_DB_PATH: dbPath,
     MOTIF_PORT: String(API_PORT),
     MOTIF_WEB_PORT: String(WEB_PORT),
+    MOTIF_WEB_ORIGIN: WEB_URL,
   });
   const web = spawnProcess("web", ["--prefix", "web", "run", "dev", "--", "--host", "127.0.0.1"], {
     MOTIF_WEB_PORT: String(WEB_PORT),
@@ -356,7 +507,15 @@ async function main() {
       apiUrl: API_URL,
       webUrl: WEB_URL,
       dbPath,
-      covered: ["generation-sse", "frontend-preview-direct-edit", "board-navigation", "isolated-db"],
+      covered: [
+        "generation-sse",
+        "gallery-scroll-policy",
+        "topbar-model-persistence",
+        "settings-workspace",
+        "frontend-preview-direct-edit",
+        "board-navigation",
+        "isolated-db",
+      ],
     }, null, 2));
   } finally {
     await stopProcess(web);

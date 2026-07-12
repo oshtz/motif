@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef } from "react";
 import { useAppStore, useSettingsStore } from "./store";
 import { fetchMotifs } from "./api";
 import DesktopTitleBar from "./components/DesktopTitleBar";
@@ -41,9 +41,15 @@ export default function App() {
     loadGenerations,
     generationsLoading,
     generationsError,
+    streamingVariants,
   } = useAppStore();
   const { loaded, onboardingComplete, loadSettings, loadGenomes } = useSettingsStore();
   const keepGalleryMounted = activeTab === "gallery" || activeTab === "preview";
+  const galleryScrollRef = useRef<HTMLDivElement>(null);
+  const galleryScrollPosition = useRef(0);
+  const previousTab = useRef(activeTab);
+  const initialGalleryPositioned = useRef(false);
+  const streamingCountsByMotif = useRef(new Map<string, number>());
 
   useEffect(() => {
     loadSettings();
@@ -72,6 +78,43 @@ export default function App() {
   useEffect(() => {
     if (activeTab === "preview" && styleDropperMode) exitDropperMode();
   }, [activeTab, styleDropperMode, exitDropperMode]);
+
+  useEffect(() => {
+    if (initialGalleryPositioned.current || generationsLoading) return;
+    const frame = requestAnimationFrame(() => {
+      const scroller = galleryScrollRef.current;
+      if (!scroller) return;
+      scroller.scrollTo({ top: 0 });
+      initialGalleryPositioned.current = true;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [generationsLoading]);
+
+  useEffect(() => {
+    const motifKey = (motifId?: string | null) => motifId ?? "__all__";
+    const currentCounts = new Map<string, number>();
+    for (const variant of streamingVariants) {
+      const key = motifKey(variant.motifId);
+      currentCounts.set(key, (currentCounts.get(key) ?? 0) + 1);
+    }
+    const activeKey = motifKey(activeMotifId);
+    const hasNewActiveVariant =
+      (currentCounts.get(activeKey) ?? 0) >
+      (streamingCountsByMotif.current.get(activeKey) ?? 0);
+    streamingCountsByMotif.current = currentCounts;
+
+    if (hasNewActiveVariant && activeTab === "gallery") {
+      galleryScrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  }, [activeMotifId, activeTab, streamingVariants]);
+
+  useLayoutEffect(() => {
+    if (previousTab.current === "preview" && activeTab === "gallery") {
+      const scroller = galleryScrollRef.current;
+      if (scroller) scroller.scrollTop = galleryScrollPosition.current;
+    }
+    previousTab.current = activeTab;
+  }, [activeTab]);
 
   if (!loaded) {
     return (
@@ -113,7 +156,17 @@ export default function App() {
           {activeMotifId !== null && <ChatSidebar />}
 
           {/* Masonry grid */}
-          <div className={`flex-1 overflow-auto ${activeMotifId === null ? "pb-24" : ""}`}>
+          <div
+            ref={galleryScrollRef}
+            data-testid="gallery-scroller"
+            className={`flex-1 overflow-auto ${activeMotifId === null ? "pb-24" : ""}`}
+            style={{ overflowAnchor: "none" }}
+            onScroll={(event) => {
+              if (useAppStore.getState().activeTab === "gallery") {
+                galleryScrollPosition.current = event.currentTarget.scrollTop;
+              }
+            }}
+          >
             <MasonryGrid />
           </div>
         </div>

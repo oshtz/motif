@@ -48,7 +48,9 @@ export default function MasonryGrid() {
     const el = containerRef.current;
     if (!el) return;
     const observer = new ResizeObserver(([entry]) => {
-      setColCount(calcCols(entry.contentRect.width));
+      if (entry.contentRect.width > 0) {
+        setColCount(calcCols(entry.contentRect.width));
+      }
     });
     observer.observe(el);
     return () => observer.disconnect();

@@ -123,6 +123,18 @@ try {
     page.locator('[data-testid="window-close"]').count(),
   ]);
   assert.deepEqual(controls, [1, 1, 1]);
+  assert.equal(await page.locator('[data-testid="model-picker-trigger"]').count(), 1);
+  assert.equal(await page.locator('[data-testid="gallery-scroller"]').evaluate((element) => element.scrollTop), 0);
+
+  await page.getByLabel("Open Tools and Advanced menu").click();
+  await page.getByRole("button", { name: "Settings & Advanced" }).click();
+  await settingsDialog.waitFor({ state: "visible" });
+  const settingsBox = await settingsDialog.boundingBox();
+  assert.ok(settingsBox && settingsBox.width > 700);
+  await settingsDialog.locator('nav[aria-label="Settings categories"] button', { hasText: "Data" }).click();
+  await settingsDialog.getByRole("heading", { name: "Data", exact: true }).waitFor({ state: "visible" });
+  await page.keyboard.press("Escape");
+  await settingsDialog.waitFor({ state: "hidden" });
 
   await page.locator('[data-testid="window-minimize"]').click();
   await page.waitForTimeout(300);
