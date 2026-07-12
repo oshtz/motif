@@ -1,6 +1,6 @@
 {
   "name": "motif",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "AI-powered UI generation with design genomes",
   "author": "Omer Shatzberg",
   "private": true,

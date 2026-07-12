@@ -2,7 +2,6 @@ const crypto = require("crypto");
 const fs = require("fs");
 const https = require("https");
 const path = require("path");
-const { spawn } = require("child_process");
 const { pipeline } = require("stream/promises");
 
 const RELEASE_API_URL = "https://api.github.com/repos/oshtz/motif/releases/latest";
@@ -276,29 +275,21 @@ try {
 `;
 }
 
-async function replacePortableExecutableAndRelaunch({ currentExePath, newExePath, tempRoot }) {
+async function replacePortableExecutableAndRelaunch({ app, currentExePath, newExePath, tempRoot }) {
   const updateDir = path.join(tempRoot, "motif-portable-updater");
   await fs.promises.mkdir(updateDir, { recursive: true });
 
   const scriptPath = path.join(updateDir, "apply-portable-update.ps1");
   const logPath = path.join(updateDir, "portable-update.log");
   const script = buildReplacementScript({ currentExePath, newExePath, logPath });
+  await fs.promises.rm(logPath, { force: true });
   await fs.promises.writeFile(scriptPath, script, "utf8");
 
-  const child = spawn("powershell.exe", [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    scriptPath,
-  ], {
-    cwd: updateDir,
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
+  const powershellPath = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  app.relaunch({
+    execPath: powershellPath,
+    args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
   });
-
-  child.unref();
 }
 
 async function configurePortableUpdater({ app, dialog }) {
@@ -327,6 +318,7 @@ async function configurePortableUpdater({ app, dialog }) {
 
     const newExePath = await downloadPortableUpdate(update, app.getPath("temp"));
     await replacePortableExecutableAndRelaunch({
+      app,
       currentExePath,
       newExePath,
       tempRoot: app.getPath("temp"),
